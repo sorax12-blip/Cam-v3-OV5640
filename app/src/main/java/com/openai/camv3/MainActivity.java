@@ -122,7 +122,7 @@ public class MainActivity extends Activity {
         scanner.startScan(Collections.singletonList(filter), settings, scanCallback);
         handler.postDelayed(() -> {
             try { if (scanner != null) scanner.stopScan(scanCallback); } catch (Exception ignored) {}
-            if (gatt == null) jsMessage("Camera not found. Make sure the locking Bluetooth switch is ON.");
+            if (gatt == null) jsMessage("Camera not found. Press the camera Bluetooth button and try again within its 30-second advertising window.");
         }, 12000);
     }
 
