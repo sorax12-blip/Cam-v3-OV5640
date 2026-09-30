@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Cam v3 - OV5640</title>
+<style>
+  :root{color-scheme:dark;--bg:#0f1115;--panel:#171a21;--panel2:#20242d;--text:#f4f7fb;--muted:#9ca7b8;--accent:#4da3ff;--green:#3ddc84;--warn:#ffca58;--border:#303745}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{position:sticky;top:0;z-index:5;background:rgba(15,17,21,.95);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);padding:14px 16px}
+  .head{display:flex;align-items:center;gap:10px;max-width:1100px;margin:auto}.title{font-weight:750;font-size:20px;flex:1}.dot{width:10px;height:10px;border-radius:50%;background:#666}.dot.on{background:var(--green);box-shadow:0 0 12px var(--green)}
+  button{border:1px solid var(--border);background:var(--panel2);color:var(--text);border-radius:10px;padding:10px 13px;font-weight:650;cursor:pointer}button.primary{background:#116fd1;border-color:#267fda}button:disabled{opacity:.45;cursor:not-allowed}
+  main{max-width:1100px;margin:auto;padding:16px}.notice,.status{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin-bottom:12px}.notice{color:var(--muted)}
+  .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:12px 0}.crumbs{display:flex;gap:6px;flex-wrap:wrap;align-items:center;flex:1}.crumb{color:#8fc3ff;cursor:pointer}.sep{color:#596273}
+  .summary{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}.pill{background:var(--panel);border:1px solid var(--border);padding:6px 9px;border-radius:999px;color:var(--muted)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px}.item{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:12px;min-height:96px;display:flex;flex-direction:column;gap:8px}.row{display:flex;gap:10px;align-items:center}.ico{font-size:26px;width:32px}.name{font-weight:700;overflow-wrap:anywhere}.meta{color:var(--muted);font-size:13px}.actions{display:flex;gap:8px;margin-top:auto}.actions button{padding:8px 10px;font-size:13px}.video-note{color:var(--warn);font-size:12px}
+  #empty{padding:28px;text-align:center;color:var(--muted)}
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;z-index:20;align-items:center;justify-content:center;padding:16px}.modal.open{display:flex}.modalbox{max-width:min(1100px,96vw);max-height:94vh;display:flex;flex-direction:column;gap:10px}.modal img{max-width:94vw;max-height:82vh;object-fit:contain;border-radius:12px;background:#000}.modalbar{display:flex;gap:8px;align-items:center}.modalname{flex:1;overflow-wrap:anywhere}
+  .progress{height:5px;background:#28303b;border-radius:999px;overflow:hidden}.bar{height:100%;width:0;background:var(--accent);transition:width .1s linear}.hidden{display:none!important}
+  @media(max-width:600px){.title{font-size:17px}.head button{padding:8px 9px}.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header><div class="head"><div id="connDot" class="dot"></div><div class="title">Cam v3 - OV5640</div><button id="connectBtn" class="primary">Connect</button><button id="disconnectBtn" disabled>Disconnect</button></div></header>
+<main>
+  <div class="notice">Turn the camera's locking Bluetooth switch ON first. The viewer indexes <b>folder metadata for the entire SD card</b>, then requests file names only for the folder you open. Picture bytes are transferred only when you tap <b>View</b> or <b>Download</b>. Videos are listed but intentionally cannot be opened or downloaded.</div>
+  <div id="status" class="status">Not connected.</div>
+  <div id="progressWrap" class="progress hidden"><div id="progressBar" class="bar"></div></div>
+  <div class="summary"><span id="folderCount" class="pill">0 folders indexed</span><span id="picCount" class="pill">0 pictures</span><span id="vidCount" class="pill">0 videos</span></div>
+  <div class="toolbar"><button id="upBtn" disabled>← Up</button><div id="crumbs" class="crumbs"></div><button id="refreshBtn" disabled>Refresh folder</button><button id="reindexBtn" disabled>Re-index card</button></div>
+  <div id="grid" class="grid"></div><div id="empty">Connect to the camera to browse the SD card.</div>
+</main>
+<div id="modal" class="modal"><div class="modalbox"><div class="modalbar"><div id="modalName" class="modalname"></div><button id="closeModal">Close</button></div><img id="previewImg" alt="Picture preview" /></div></div>
+<script>
+(() => {
+'use strict';
+const DEVICE_NAME='Cam v3 - OV5640';
+const SERVICE='b6a30001-6e8c-4b74-a4c2-3b33d2c7a001';
+const COMMAND='b6a30002-6e8c-4b74-a4c2-3b33d2c7a001';
+const STATUS='b6a30003-6e8c-4b74-a4c2-3b33d2c7a001';
+const DATA='b6a30004-6e8c-4b74-a4c2-3b33d2c7a001';
+const native=!!window.AndroidBridge;
+let device,gatt,cmdChar,statusChar,dataChar;
+let connected=false,statusBuffer='';
+let folders=new Map();
+let currentPath='/';
+let currentItems=[];
+let activeListPath=null;
+let transfer=null;
+let previewUrl=null;
+const $=id=>document.getElementById(id);
+const enc=new TextEncoder(),dec=new TextDecoder();
+function setStatus(s){$('status').textContent=s;}
+function setConnected(v){connected=v;$('connDot').classList.toggle('on',v);$('connectBtn').disabled=v;$('disconnectBtn').disabled=!v;$('refreshBtn').disabled=!v;$('reindexBtn').disabled=!v;if(!v){$('upBtn').disabled=true;}}
+function normalize(p){if(!p||p==='/')return '/';p=p.replace(/\\/g,'/').replace(/\/+/g,'/');if(!p.startsWith('/'))p='/'+p;return p.length>1?p.replace(/\/$/,''):p;}
+function parentOf(p){p=normalize(p);if(p==='/')return null;const i=p.lastIndexOf('/');return i<=0?'/':p.slice(0,i);}
+function basename(p){p=normalize(p);if(p==='/')return '/';return p.slice(p.lastIndexOf('/')+1);}
+function fmt(n){n=Number(n)||0;if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';return (n/1048576).toFixed(1)+' MB';}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+async function connect(){try{if(native){setStatus('Scanning for '+DEVICE_NAME+'…');window.AndroidBridge.connect();return;}if(!navigator.bluetooth){throw new Error('Web Bluetooth is not available. Use Chrome/Edge on Android/desktop over HTTPS or localhost, or use the companion APK.');}device=await navigator.bluetooth.requestDevice({filters:[{name:DEVICE_NAME}],optionalServices:[SERVICE]});device.addEventListener('gattserverdisconnected',()=>onDisconnected());setStatus('Connecting…');gatt=await device.gatt.connect();const svc=await gatt.getPrimaryService(SERVICE);[cmdChar,statusChar,dataChar]=await Promise.all([svc.getCharacteristic(COMMAND),svc.getCharacteristic(STATUS),svc.getCharacteristic(DATA)]);await statusChar.startNotifications();await dataChar.startNotifications();statusChar.addEventListener('characteristicvaluechanged',e=>feedStatus(dec.decode(e.target.value)));dataChar.addEventListener('characteristicvaluechanged',e=>feedData(new Uint8Array(e.target.value.buffer.slice(e.target.value.byteOffset,e.target.value.byteOffset+e.target.value.byteLength))));onConnected();}catch(e){setStatus('Connect failed: '+e.message);setConnected(false);}}
+function disconnect(){if(native){window.AndroidBridge.disconnect();return;}if(device?.gatt?.connected)device.gatt.disconnect();else onDisconnected();}
+function onConnected(){setConnected(true);setStatus('Connected. Indexing SD card folders…');folders.clear();currentItems=[];render();send('INDEX');}
+function onDisconnected(){setConnected(false);setStatus('Disconnected.');transfer=null;activeListPath=null;}
+async function send(text){if(!connected)return;if(native){window.AndroidBridge.sendCommand(text);return;}const data=enc.encode(text);if(cmdChar.writeValueWithoutResponse)await cmdChar.writeValueWithoutResponse(data);else await cmdChar.writeValue(data);}
+function feedStatus(chunk){statusBuffer+=chunk;let i;while((i=statusBuffer.indexOf('\n'))>=0){const line=statusBuffer.slice(0,i).replace(/\r$/,'');statusBuffer=statusBuffer.slice(i+1);if(line)handleLine(line);}}
+function handleLine(line){if(line.startsWith('BEGIN INDEX')){folders.clear();$('folderCount').textContent='Indexing folders…';setStatus('Indexing SD card folder tree…');return;}if(line.startsWith('I\tD\t')){const a=line.split('\t');const p=normalize(a[2]);folders.set(p,{dirs:+(a[3]||0),pics:+(a[4]||0),videos:+(a[5]||0),other:+(a[6]||0)});return;}if(line.startsWith('END INDEX')){const m=line.match(/folders=(\d+).*pics=(\d+).*videos=(\d+)/);$('folderCount').textContent=(m?m[1]:folders.size)+' folders indexed';$('picCount').textContent=(m?m[2]:'?')+' pictures';$('vidCount').textContent=(m?m[3]:'?')+' videos';setStatus('Index complete. Loading '+currentPath+'…');openFolder(currentPath);return;}if(line.startsWith('BEGIN LIST ')){activeListPath=normalize(line.slice(11).trim());currentItems=[];return;}if(/^[DPVF]\t/.test(line)&&activeListPath){const a=line.split('\t');currentItems.push({type:a[0],path:normalize(a[1]),size:+(a[2]||0)});return;}if(line.startsWith('END LIST ')){activeListPath=null;setStatus('Viewing '+currentPath);render();return;}if(line.startsWith('BEGIN GET ')){const m=line.match(/^BEGIN GET (.*) (\d+)$/);if(transfer&&m){transfer.expected=+m[2];updateProgress();}return;}if(line.startsWith('END GET ')){finishTransfer();return;}if(line.startsWith('CANCEL GET')||line.startsWith('ERR ')){if(transfer){transfer=null;hideProgress();}setStatus(line);return;}}
+function feedData(u8){if(!transfer||u8.length<4)return;const off=(u8[0]|u8[1]<<8|u8[2]<<16|u8[3]<<24)>>>0;const bytes=u8.slice(4);transfer.chunks.push({off,bytes});transfer.received+=bytes.length;updateProgress();}
+function updateProgress(){if(!transfer)return;$('progressWrap').classList.remove('hidden');const pct=transfer.expected?Math.min(100,transfer.received*100/transfer.expected):0;$('progressBar').style.width=pct+'%';setStatus((transfer.mode==='view'?'Loading ':'Downloading ')+basename(transfer.path)+' — '+fmt(transfer.received)+(transfer.expected?' / '+fmt(transfer.expected):''));}
+function hideProgress(){$('progressWrap').classList.add('hidden');$('progressBar').style.width='0%';}
+function assemble(){transfer.chunks.sort((a,b)=>a.off-b.off);let total=transfer.expected||transfer.chunks.reduce((n,c)=>Math.max(n,c.off+c.bytes.length),0);const out=new Uint8Array(total);for(const c of transfer.chunks)out.set(c.bytes,c.off);return out;}
+function bytesToBase64(bytes){let s='';const step=0x8000;for(let i=0;i<bytes.length;i+=step)s+=String.fromCharCode(...bytes.subarray(i,i+step));return btoa(s);}
+function finishTransfer(){if(!transfer)return;const t=transfer;const bytes=assemble();transfer=null;hideProgress();if(t.mode==='view'){if(previewUrl)URL.revokeObjectURL(previewUrl);previewUrl=URL.createObjectURL(new Blob([bytes],{type:'image/jpeg'}));$('previewImg').src=previewUrl;$('modalName').textContent=t.path;$('modal').classList.add('open');setStatus('Loaded '+basename(t.path));}else{const filename=basename(t.path);if(native){window.AndroidBridge.saveFile(filename,bytesToBase64(bytes));setStatus('Saving '+filename+' to Downloads…');}else{const url=URL.createObjectURL(new Blob([bytes],{type:'image/jpeg'}));const a=document.createElement('a');a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);setStatus('Downloaded '+filename);}}}
+function getPicture(path,mode){if(transfer)return setStatus('A transfer is already in progress.');transfer={path,mode,expected:0,received:0,chunks:[]};updateProgress();send('GET '+path);}
+function childFoldersOf(path){path=normalize(path);const out=[];for(const p of folders.keys()){if(p==='/'||p===path)continue;if(parentOf(p)===path)out.push({type:'D',path:p,size:0});}return out.sort((a,b)=>a.path.localeCompare(b.path,undefined,{numeric:true}));}
+function openFolder(path){currentPath=normalize(path);$('upBtn').disabled=!connected||currentPath==='/';renderCrumbs();currentItems=[];render();if(connected)send('LIST '+currentPath);}
+function renderCrumbs(){const c=$('crumbs');c.innerHTML='';const root=document.createElement('span');root.className='crumb';root.textContent='SD';root.onclick=()=>openFolder('/');c.appendChild(root);if(currentPath!=='/'){let cur='';for(const part of currentPath.split('/').filter(Boolean)){c.appendChild(Object.assign(document.createElement('span'),{className:'sep',textContent:'›'}));cur+='/'+part;const e=document.createElement('span');e.className='crumb';e.textContent=part;const target=cur;e.onclick=()=>openFolder(target);c.appendChild(e);}}}
+function render(){renderCrumbs();const g=$('grid');g.innerHTML='';const dirs=childFoldersOf(currentPath);const listed=currentItems.filter(x=>x.type!=='D');const list=[...dirs,...listed.sort((a,b)=>a.path.localeCompare(b.path,undefined,{numeric:true}))];$('empty').style.display=list.length?'none':'block';$('empty').textContent=connected?'This folder is empty or still loading.':'Connect to the camera to browse the SD card.';for(const it of list){const d=document.createElement('div');d.className='item';let ico=it.type==='D'?'📁':it.type==='P'?'🖼️':it.type==='V'?'🎬':'📄';let meta=it.type==='D'?(folders.get(it.path)?`${folders.get(it.path).pics} pictures · ${folders.get(it.path).videos} videos`:'Folder'):fmt(it.size);d.innerHTML=`<div class="row"><div class="ico">${ico}</div><div><div class="name">${escapeHtml(basename(it.path))}</div><div class="meta">${escapeHtml(meta)}</div></div></div>`;const acts=document.createElement('div');acts.className='actions';if(it.type==='D'){const b=document.createElement('button');b.textContent='Open folder';b.onclick=()=>openFolder(it.path);acts.appendChild(b);}else if(it.type==='P'){const v=document.createElement('button');v.textContent='View';v.onclick=()=>getPicture(it.path,'view');const dl=document.createElement('button');dl.textContent='Download';dl.onclick=()=>getPicture(it.path,'download');acts.append(v,dl);}else if(it.type==='V'){const n=document.createElement('div');n.className='video-note';n.textContent='Video file is visible in the index, but opening and downloading are disabled.';d.appendChild(n);}d.appendChild(acts);g.appendChild(d);}}
+$('connectBtn').onclick=connect;$('disconnectBtn').onclick=disconnect;$('upBtn').onclick=()=>{const p=parentOf(currentPath);if(p)openFolder(p)};$('refreshBtn').onclick=()=>openFolder(currentPath);$('reindexBtn').onclick=()=>{folders.clear();currentItems=[];render();setStatus('Re-indexing SD card…');send('INDEX')};$('closeModal').onclick=()=>$('modal').classList.remove('open');$('modal').onclick=e=>{if(e.target===$('modal'))$('modal').classList.remove('open')};
+window.onNativeConnected=()=>onConnected();window.onNativeDisconnected=()=>onDisconnected();window.onNativeStatus=t=>feedStatus(t);window.onNativeData=(off,b64)=>{const bin=atob(b64),u=new Uint8Array(bin.length+4);u[0]=off&255;u[1]=(off>>>8)&255;u[2]=(off>>>16)&255;u[3]=(off>>>24)&255;for(let i=0;i<bin.length;i++)u[i+4]=bin.charCodeAt(i);feedData(u)};window.onNativeMessage=m=>setStatus(m);
+renderCrumbs();setConnected(false);
+})();
+</script>
+</body>
+</html>
