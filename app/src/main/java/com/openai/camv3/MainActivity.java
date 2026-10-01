@@ -69,6 +69,12 @@ public class MainActivity extends Activity {
         adapter = manager.getAdapter();
 
         webView = new WebView(this);
+        webView.setOnApplyWindowInsetsListener((v, insets) -> {
+            int top = insets.getSystemWindowInsetTop();
+            int bottom = insets.getSystemWindowInsetBottom();
+            v.setPadding(0, top, 0, bottom);
+            return insets;
+        });
         setContentView(webView);
         WebSettings ws = webView.getSettings();
         ws.setJavaScriptEnabled(true);
@@ -122,7 +128,7 @@ public class MainActivity extends Activity {
         scanner.startScan(Collections.singletonList(filter), settings, scanCallback);
         handler.postDelayed(() -> {
             try { if (scanner != null) scanner.stopScan(scanCallback); } catch (Exception ignored) {}
-            if (gatt == null) jsMessage("Camera not found. Press the camera Bluetooth button and try again within its 30-second advertising window.");
+            // Silent timeout: the personal UI does not need a persistent "camera not found" message.
         }, 12000);
     }
 
