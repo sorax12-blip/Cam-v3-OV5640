@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-<title>Cam v3 - OV5640</title>
+<title>ESP32 Cam HD</title>
 <style>
   :root{color-scheme:dark;--bg:#0f1115;--panel:#171a21;--panel2:#20242d;--text:#f4f7fb;--muted:#9ca7b8;--accent:#4da3ff;--green:#3ddc84;--warn:#ffca58;--border:#303745}
   *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
@@ -21,7 +21,7 @@
 </style>
 </head>
 <body>
-<header><div class="head"><div id="connDot" class="dot"></div><div class="title">Cam v3 - OV5640</div><button id="connectBtn" class="primary">Connect</button><button id="disconnectBtn" disabled>Disconnect</button></div></header>
+<header><div class="head"><div id="connDot" class="dot"></div><div class="title">ESP32 Cam HD</div><button id="connectBtn" class="primary">Connect</button><button id="disconnectBtn" disabled>Disconnect</button></div></header>
 <main>
   <div class="notice">Press the camera's momentary Bluetooth button first. The camera advertises for 30 seconds; the blue LED blinks while waiting and turns solid when connected. The viewer indexes <b>folder metadata for the entire SD card</b>, then requests file names only for the folder you open. Picture bytes are transferred only when you tap <b>View</b> or <b>Download</b>. Videos are listed but intentionally cannot be opened or downloaded.</div>
   <div id="status" class="status">Not connected.</div>
@@ -34,7 +34,7 @@
 <script>
 (() => {
 'use strict';
-const DEVICE_NAME='Cam v3 - OV5640';
+const DEVICE_NAME='ESP32 Cam HD';
 const SERVICE='b6a30001-6e8c-4b74-a4c2-3b33d2c7a001';
 const COMMAND='b6a30002-6e8c-4b74-a4c2-3b33d2c7a001';
 const STATUS='b6a30003-6e8c-4b74-a4c2-3b33d2c7a001';
