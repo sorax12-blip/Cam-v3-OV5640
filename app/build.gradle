@@ -8,8 +8,8 @@ android {
         applicationId 'com.openai.esp32camhd'
         minSdk 29
         targetSdk 35
-        versionCode 1
-        versionName '2.0'
+        versionCode 3
+        versionName '2.2'
     }
 
     buildTypes {
