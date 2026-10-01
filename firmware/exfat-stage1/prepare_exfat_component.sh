@@ -36,10 +36,28 @@ s2, count = re.subn(
 if count != 1:
     raise SystemExit("Could not patch FF_FS_EXFAT in ffconf.h")
 
-p.write_text(s2)
+# FF_USE_LABEL expands to CONFIG_FATFS_USE_LABEL in ESP-IDF. When that
+# bool is disabled sdkconfig.h does not define it, and exFAT code references
+# FF_USE_LABEL as a normal C expression. We do not need volume-label APIs for
+# this camera, so make it an explicit numeric 0.
+s3, label_count = re.subn(
+    r'(?m)^(\s*#define\s+FF_USE_LABEL\s+)CONFIG_FATFS_USE_LABEL(\s*)
+PY
+
+echo "Project-local FatFs override prepared."
+,
+    r'\g<1>0\2',
+    s2,
+    count=1,
+)
+if label_count != 1:
+    raise SystemExit("Could not patch FF_USE_LABEL in ffconf.h")
+
+p.write_text(s3)
 print("Patched:", p)
 print("  FF_FS_EXFAT = 1")
-print("  FF_LBA64    = 0 (sufficient for 64-256 GB cards)")
+print("  FF_USE_LABEL = 0")
+print("  FF_LBA64     = 0 (sufficient for 64-256 GB cards)")
 PY
 
 echo "Project-local FatFs override prepared."
