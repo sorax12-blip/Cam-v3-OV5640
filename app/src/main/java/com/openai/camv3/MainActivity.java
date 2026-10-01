@@ -46,7 +46,7 @@ import java.util.Collections;
 import java.util.UUID;
 
 public class MainActivity extends Activity {
-    private static final String DEVICE_NAME = "Cam v3 - OV5640";
+    private static final String DEVICE_NAME = "ESP32 Cam HD";
     private static final UUID SERVICE_UUID = UUID.fromString("b6a30001-6e8c-4b74-a4c2-3b33d2c7a001");
     private static final UUID COMMAND_UUID = UUID.fromString("b6a30002-6e8c-4b74-a4c2-3b33d2c7a001");
     private static final UUID STATUS_UUID = UUID.fromString("b6a30003-6e8c-4b74-a4c2-3b33d2c7a001");
@@ -240,7 +240,7 @@ public class MainActivity extends Activity {
                 ContentValues values = new ContentValues();
                 values.put(MediaStore.Downloads.DISPLAY_NAME, filename);
                 values.put(MediaStore.Downloads.MIME_TYPE, "image/jpeg");
-                values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Cam v3");
+                values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/ESP32 Cam HD");
                 Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
                 if (uri == null) throw new Exception("Could not create Downloads file");
                 try (OutputStream out = getContentResolver().openOutputStream(uri)) { out.write(data); }
@@ -249,7 +249,7 @@ public class MainActivity extends Activity {
                 if (!dir.exists()) dir.mkdirs();
                 try (FileOutputStream out = new FileOutputStream(new File(dir, filename))) { out.write(data); }
             }
-            jsMessage("Saved " + filename + " to Downloads/Cam v3");
+            jsMessage("Saved " + filename + " to Downloads/ESP32 Cam HD");
         } catch (Exception e) { jsMessage("Save failed: " + e.getMessage()); }
     }
 
