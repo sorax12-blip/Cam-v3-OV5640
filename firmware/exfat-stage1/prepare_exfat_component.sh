@@ -19,6 +19,7 @@ rm -rf "$DST"
 cp -a "$SRC" "$DST"
 
 CONF="$DST/src/ffconf.h"
+
 python3 - "$CONF" <<'PY'
 from pathlib import Path
 import re
@@ -27,37 +28,30 @@ import sys
 p = Path(sys.argv[1])
 s = p.read_text()
 
-s2, count = re.subn(
+s, exfat_count = re.subn(
     r'(?m)^(\s*#define\s+FF_FS_EXFAT\s+)0(\s*)$',
     r'\g<1>1\2',
     s,
     count=1,
 )
-if count != 1:
+if exfat_count != 1:
     raise SystemExit("Could not patch FF_FS_EXFAT in ffconf.h")
 
-# FF_USE_LABEL expands to CONFIG_FATFS_USE_LABEL in ESP-IDF. When that
-# bool is disabled sdkconfig.h does not define it, and exFAT code references
-# FF_USE_LABEL as a normal C expression. We do not need volume-label APIs for
-# this camera, so make it an explicit numeric 0.
-s3, label_count = re.subn(
-    r'(?m)^(\s*#define\s+FF_USE_LABEL\s+)CONFIG_FATFS_USE_LABEL(\s*)
-PY
-
-echo "Project-local FatFs override prepared."
-,
+s, label_count = re.subn(
+    r'(?m)^(\s*#define\s+FF_USE_LABEL\s+)CONFIG_FATFS_USE_LABEL(\s*)$',
     r'\g<1>0\2',
-    s2,
+    s,
     count=1,
 )
 if label_count != 1:
     raise SystemExit("Could not patch FF_USE_LABEL in ffconf.h")
 
-p.write_text(s3)
+p.write_text(s)
+
 print("Patched:", p)
 print("  FF_FS_EXFAT = 1")
 print("  FF_USE_LABEL = 0")
-print("  FF_LBA64     = 0 (sufficient for 64-256 GB cards)")
+print("  FF_LBA64 = 0 (sufficient for 64-256 GB cards)")
 PY
 
 echo "Project-local FatFs override prepared."
