@@ -1,0 +1,68 @@
+name: Build ESP32 exFAT Stage 1
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - esp32-cam-hd-s26-fix
+    paths:
+      - 'firmware/exfat-stage1/**'
+      - '.github/workflows/build-exfat-stage1.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build ESP32-S3 exFAT Stage 1
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.5
+          target: esp32s3
+          path: firmware/exfat-stage1
+          command: >-
+            bash prepare_exfat_component.sh &&
+            idf.py set-target esp32s3 &&
+            idf.py build &&
+            esptool.py --chip esp32s3 merge_bin
+            -o build/ESP32_Cam_HD_exFAT_STAGE1_MERGED.bin
+            0x0 build/bootloader/bootloader.bin
+            0x8000 build/partition_table/partition-table.bin
+            0x10000 build/esp32_cam_hd_exfat_stage1.bin
+
+      - name: Collect firmware files
+        shell: bash
+        run: |
+          mkdir -p firmware/exfat-stage1/artifact
+          cp firmware/exfat-stage1/build/ESP32_Cam_HD_exFAT_STAGE1_MERGED.bin firmware/exfat-stage1/artifact/
+          cp firmware/exfat-stage1/build/esp32_cam_hd_exfat_stage1.bin firmware/exfat-stage1/artifact/
+          cp firmware/exfat-stage1/build/bootloader/bootloader.bin firmware/exfat-stage1/artifact/
+          cp firmware/exfat-stage1/build/partition_table/partition-table.bin firmware/exfat-stage1/artifact/
+          cp firmware/exfat-stage1/build/flash_args firmware/exfat-stage1/artifact/ 2>/dev/null || true
+          cat > firmware/exfat-stage1/artifact/FLASH_INFO.txt <<'EOF'
+          ESP32 Cam HD exFAT Stage 1
+          Target: ESP32-S3
+          Flash size: 16 MB
+
+          Preferred phone flashing file:
+            ESP32_Cam_HD_exFAT_STAGE1_MERGED.bin
+          Flash merged binary at address:
+            0x0
+
+          Individual offsets if needed:
+            0x0000  bootloader.bin
+            0x8000  partition-table.bin
+            0x10000 esp32_cam_hd_exfat_stage1.bin
+
+          This is a diagnostic exFAT mount/read/write test, not final camera firmware.
+          EOF
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ESP32-Cam-HD-exFAT-Stage1
+          path: firmware/exfat-stage1/artifact/
+          if-no-files-found: error
