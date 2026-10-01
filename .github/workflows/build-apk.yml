@@ -2,7 +2,7 @@ name: Build Android APK
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, esp32-cam-hd-s26-fix ]
 
 jobs:
   build:
