@@ -24,6 +24,11 @@ jobs:
           target: esp32s3
           path: firmware/exfat-stage2-msc
           command: >-
+            rm -rf /tmp/esp32-arduino-lib-builder &&
+            git clone --depth 1 https://github.com/espressif/esp32-arduino-lib-builder.git /tmp/esp32-arduino-lib-builder &&
+            mkdir -p components &&
+            cp -a /tmp/esp32-arduino-lib-builder/components/arduino_tinyusb components/arduino_tinyusb &&
+            git clone --depth 1 https://github.com/hathach/tinyusb.git components/arduino_tinyusb/tinyusb &&
             bash prepare_exfat_component.sh &&
             idf.py set-target esp32s3 &&
             idf.py build &&
