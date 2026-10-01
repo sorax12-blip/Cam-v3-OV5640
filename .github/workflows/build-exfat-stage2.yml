@@ -1,0 +1,70 @@
+name: Build ESP32 exFAT Stage 2 MSC
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - esp32-cam-hd-s26-fix
+    paths:
+      - 'firmware/exfat-stage2-msc/**'
+      - '.github/workflows/build-exfat-stage2.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build ESP32-S3 exFAT Stage 2 MSC
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.5
+          target: esp32s3
+          path: firmware/exfat-stage2-msc
+          command: >-
+            bash prepare_exfat_component.sh &&
+            idf.py set-target esp32s3 &&
+            idf.py build &&
+            esptool.py --chip esp32s3 merge_bin
+            -o build/ESP32_Cam_HD_exFAT_STAGE2_MSC_MERGED.bin
+            0x0 build/bootloader/bootloader.bin
+            0x8000 build/partition_table/partition-table.bin
+            0x10000 build/esp32_cam_hd_exfat_stage2_msc.bin
+
+      - name: Collect firmware files
+        shell: bash
+        run: |
+          mkdir -p firmware/exfat-stage2-msc/artifact
+          cp firmware/exfat-stage2-msc/build/ESP32_Cam_HD_exFAT_STAGE2_MSC_MERGED.bin firmware/exfat-stage2-msc/artifact/
+          cp firmware/exfat-stage2-msc/build/esp32_cam_hd_exfat_stage2_msc.bin firmware/exfat-stage2-msc/artifact/
+          cp firmware/exfat-stage2-msc/build/bootloader/bootloader.bin firmware/exfat-stage2-msc/artifact/
+          cp firmware/exfat-stage2-msc/build/partition_table/partition-table.bin firmware/exfat-stage2-msc/artifact/
+          cat > firmware/exfat-stage2-msc/artifact/FLASH_INFO.txt <<'EOF'
+          ESP32 Cam HD exFAT Stage 2 USB MSC
+          Target: ESP32-S3
+          Flash size: 16 MB
+
+          Preferred phone flashing file:
+            ESP32_Cam_HD_exFAT_STAGE2_MSC_MERGED.bin
+
+          Flash merged binary at:
+            0x0
+
+          USB mass-storage test connection:
+            Samsung USB-C
+            -> Samsung USB-C male to USB-A female OTG adapter
+            -> USB-A male to USB-C male DATA cable
+            -> ESP32 connector labeled USB-OTG
+
+          This diagnostic build is temporarily WRITABLE.
+          Do not remove power/card while the phone is actively using USB storage.
+          EOF
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ESP32-Cam-HD-exFAT-Stage2-MSC
+          path: firmware/exfat-stage2-msc/artifact/
+          if-no-files-found: error
