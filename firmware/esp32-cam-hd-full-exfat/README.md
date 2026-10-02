@@ -11,11 +11,16 @@ Storage:
 
 Camera:
 - OV3660 / OV5640 PID auto-detect
-- QXGA 2048x1536 saved JPEG profile (shared temporary profile)
-- motion checks: 5 unsaved QQVGA comparison frames every 10 seconds
+- OV3660 saved stills: QXGA 2048x1536, JPEG Q4
+- OV5640 saved stills: QSXGA 2560x1920, JPEG Q4
+- OV5640 sensor vertical flip enabled
+- OV5640 saved JPEGs carry EXIF Orientation 8 (display 90° counter-clockwise)
+- motion checks: 5 unsaved QQVGA comparison frames every 7.5 seconds
 - >=10% changed area starts event capture
-- event photos every 750 ms
+- event photos every 600 ms
 - event recheck every 2 minutes
+- nominal event block: 200 photos
+- photo folders: 2,000 slots each (10 complete event blocks)
 
 BLE:
 - ESP32 Cam HD
