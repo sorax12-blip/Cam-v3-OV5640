@@ -19,6 +19,7 @@ import android.bluetooth.le.ScanSettings;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.graphics.Insets;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -27,6 +28,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.MediaStore;
 import android.util.Base64;
+import android.view.WindowInsets;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
@@ -65,6 +67,8 @@ public class MainActivity extends Activity {
     private int notifyStage = 0;
     private final ArrayDeque<byte[]> commandQueue = new ArrayDeque<>();
     private boolean commandWriteInProgress = false;
+    private int safeTopInset = 0;
+    private int safeBottomInset = 0;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -73,9 +77,23 @@ public class MainActivity extends Activity {
 
         webView = new WebView(this);
         webView.setOnApplyWindowInsetsListener((v, insets) -> {
-            int top = insets.getSystemWindowInsetTop();
-            int bottom = insets.getSystemWindowInsetBottom();
-            v.setPadding(0, top, 0, bottom);
+            int top;
+            int bottom;
+            if (Build.VERSION.SDK_INT >= 30) {
+                Insets safe = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                top = safe.top;
+                bottom = safe.bottom;
+            } else {
+                top = insets.getSystemWindowInsetTop();
+                bottom = insets.getSystemWindowInsetBottom();
+                if (insets.getDisplayCutout() != null) {
+                    top = Math.max(top, insets.getDisplayCutout().getSafeInsetTop());
+                    bottom = Math.max(bottom, insets.getDisplayCutout().getSafeInsetBottom());
+                }
+            }
+            safeTopInset = top;
+            safeBottomInset = bottom;
+            applySafeAreaToWeb();
             return insets;
         });
         setContentView(webView);
@@ -85,7 +103,12 @@ public class MainActivity extends Activity {
         ws.setAllowFileAccess(true);
         ws.setAllowContentAccess(false);
         webView.setWebChromeClient(new WebChromeClient());
-        webView.setWebViewClient(new WebViewClient());
+        webView.setWebViewClient(new WebViewClient() {
+            @Override public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                applySafeAreaToWeb();
+            }
+        });
         webView.addJavascriptInterface(new JsBridge(), "AndroidBridge");
         webView.loadUrl("file:///android_asset/index.html");
     }
@@ -290,6 +313,16 @@ public class MainActivity extends Activity {
             }
             jsMessage("Saved " + filename + " to Downloads/ESP32 Cam HD");
         } catch (Exception e) { jsMessage("Save failed: " + e.getMessage()); }
+    }
+
+    private void applySafeAreaToWeb() {
+        if (webView == null) return;
+        final int top = safeTopInset;
+        final int bottom = safeBottomInset;
+        handler.post(() -> webView.evaluateJavascript(
+            "document.documentElement.style.setProperty('--native-safe-top','" + top + "px');" +
+            "document.documentElement.style.setProperty('--native-safe-bottom','" + bottom + "px');",
+            null));
     }
 
     private void js(String code) { handler.post(() -> webView.evaluateJavascript(code, null)); }
