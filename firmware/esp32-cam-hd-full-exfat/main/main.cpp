@@ -29,8 +29,9 @@ struct BleIndexStats;  // Forward declaration for Arduino .ino auto-generated pr
  *
  * Saved photos:
  *   - OV3660 and OV5640 are identified automatically from the sensor PID at startup.
- *   - For now BOTH sensors use the current OV3660-tuned still profile: target
- *     2048x1536 (QXGA), JPEG quality 4. OV5640-specific tuning can be added later.
+ *   - OV3660 keeps its proven 2048x1536 (QXGA), JPEG quality 4 profile.
+ *   - OV5640 uses its maximum esp32-camera supported still size,
+ *     2560x1920 (QSXGA), JPEG quality 4.
  *   - Existing /Photos/00001... folder and F#_Pic_#.JPG naming is retained.
  *   - Each numbered folder holds up to 1,600 photos (10 full 2-minute event blocks).
  *   - Video recording has been removed completely.
@@ -177,15 +178,18 @@ static constexpr uint32_t MAX_MEDIA_FOLDERS = 99999;
 static constexpr uint32_t MAX_PHOTO_NUMBER = MAX_MEDIA_FOLDERS * PHOTOS_PER_FOLDER;
 
 // Saved still-photo quality. Lower JPEG quality number = less compression.
-// TEMPORARY SHARED PROFILE: both OV3660 and OV5640 use the OV3660-tuned
-// quality/resolution settings until the OV5640 hardware can be tested.
+// OV3660 stays on its proven QXGA profile. OV5640 uses the maximum
+// esp32-camera supported still size for this sensor: QSXGA (2560x1920).
 static constexpr uint8_t PHOTO_JPEG_QUALITY = 4;
+static constexpr framesize_t OV3660_SAVED_FRAME_SIZE = FRAMESIZE_QXGA;
+static constexpr framesize_t OV5640_SAVED_FRAME_SIZE = FRAMESIZE_QSXGA;
 static constexpr uint8_t CAMERA_FB_COUNT = 3;
 
 static const char* PHOTO_ROOT = "/Photos";
 
 static bool cameraReady = false;
 static bool sdReady = false;
+static bool qsxgaInitSucceeded = true;
 static bool qxgaInitSucceeded = true;
 static bool cameraWasInitializedOnce = false;
 
@@ -214,9 +218,9 @@ static const char* cameraModelName(CameraSensorModel model) {
   }
 }
 
-static bool cameraPidUsesCurrentQxgaProfile(uint16_t pid) {
-  // Both supported sensors intentionally use the OV3660 photo profile for now.
-  return pid == OV3660_PID || pid == OV5640_PID;
+static framesize_t preferredSavedPhotoFrameSize(uint16_t pid) {
+  if (pid == OV5640_PID) return OV5640_SAVED_FRAME_SIZE;
+  return OV3660_SAVED_FRAME_SIZE;
 }
 
 // Native USB Mass Storage state. MSC is intentionally read-only.
@@ -772,7 +776,7 @@ static void cameraBegin() {
   c.pin_pwdn = CAM_PWDN; c.pin_reset = CAM_RESET;
   c.xclk_freq_hz = 20000000;
   c.pixel_format = PIXFORMAT_JPEG;
-  c.frame_size = FRAMESIZE_QXGA;
+  c.frame_size = FRAMESIZE_QSXGA;
   c.jpeg_quality = PHOTO_JPEG_QUALITY;
   c.fb_count = CAMERA_FB_COUNT;
   c.fb_location = CAMERA_FB_IN_PSRAM;
@@ -780,9 +784,15 @@ static void cameraBegin() {
 
   esp_err_t err = esp_camera_init(&c);
   if (err != ESP_OK) {
+    Serial.printf("Camera QSXGA init failed: 0x%x; retry QXGA\n", err);
+    qsxgaInitSucceeded = false;
+    c.frame_size = FRAMESIZE_QXGA;
+    err = esp_camera_init(&c);
+  }
+  if (err != ESP_OK) {
     Serial.printf("Camera QXGA init failed: 0x%x; retry UXGA\n", err);
-    c.frame_size = FRAMESIZE_UXGA;
     qxgaInitSucceeded = false;
+    c.frame_size = FRAMESIZE_UXGA;
     err = esp_camera_init(&c);
   }
   if (err != ESP_OK) {
@@ -805,9 +815,8 @@ static void cameraBegin() {
     s->set_vflip(s, 1);
     s->set_hmirror(s, 0);
   } else if (detectedCameraSensor == CAMERA_SENSOR_OV5640) {
-    // OV5640 is detected separately, but for now we intentionally keep the
-    // same photo quality/resolution profile as the OV3660. Orientation stays
-    // at the known OV5640 baseline until the new hardware can be tested.
+    // OV5640 saved stills use the sensor's maximum esp32-camera profile:
+    // QSXGA 2560x1920 at JPEG Q4. Orientation stays at the known baseline.
     s->set_vflip(s, 0);
     s->set_hmirror(s, 0);
   } else {
@@ -815,7 +824,7 @@ static void cameraBegin() {
                   detectedCameraPid);
   }
 
-  // Shared temporary OV3660-tuned quality setting for BOTH supported sensors.
+  // Both sensors use JPEG Q4; saved resolution is selected per sensor.
   s->set_quality(s, PHOTO_JPEG_QUALITY);
 
   cameraReady = true;
@@ -824,7 +833,7 @@ static void cameraBegin() {
                   cameraModelName(detectedCameraSensor), detectedCameraPid,
                   s->status.framesize);
     if (detectedCameraSensor == CAMERA_SENSOR_OV5640) {
-      Serial.println("OV5640 detected: currently using the OV3660-tuned QXGA/JPEG profile pending hardware testing");
+      Serial.println("OV5640 detected: saved-photo target QSXGA 2560x1920, JPEG Q4");
     }
     Serial.printf("Camera initialized with %u PSRAM frame buffers\n", (unsigned)CAMERA_FB_COUNT);
     cameraWasInitializedOnce = true;
@@ -846,8 +855,12 @@ static bool configureSavedPhotoMode(bool flushAfterChange) {
   sensor_t* sensor = esp_camera_sensor_get();
   if (!sensor) return false;
 
-  const framesize_t wanted = (cameraPidUsesCurrentQxgaProfile(sensor->id.PID) && qxgaInitSucceeded)
-                               ? FRAMESIZE_QXGA : FRAMESIZE_UXGA;
+  framesize_t wanted = preferredSavedPhotoFrameSize(sensor->id.PID);
+  if (sensor->id.PID == OV5640_PID && !qsxgaInitSucceeded) {
+    wanted = qxgaInitSucceeded ? FRAMESIZE_QXGA : FRAMESIZE_UXGA;
+  } else if (sensor->id.PID != OV5640_PID && !qxgaInitSucceeded) {
+    wanted = FRAMESIZE_UXGA;
+  }
   bool changed = false;
   if (sensor->status.framesize != wanted) {
     if (sensor->set_framesize(sensor, wanted) != 0) return false;
@@ -876,11 +889,16 @@ static camera_fb_t* getHighestResolutionFrame() {
   // Recovery path: progressively lower the still resolution if the sensor or
   // frame buffers fail at the preferred setting.
   const framesize_t frameSizes[] = {
-    FRAMESIZE_QXGA, FRAMESIZE_UXGA, FRAMESIZE_SXGA,
-    FRAMESIZE_XGA, FRAMESIZE_SVGA, FRAMESIZE_VGA
+    FRAMESIZE_QSXGA, FRAMESIZE_QXGA, FRAMESIZE_UXGA,
+    FRAMESIZE_SXGA, FRAMESIZE_XGA, FRAMESIZE_SVGA, FRAMESIZE_VGA
   };
-  const int start = (cameraPidUsesCurrentQxgaProfile(sensor->id.PID) && qxgaInitSucceeded) ? 0 : 1;
-  for (int stage = start; stage < 6; ++stage) {
+  int start = 1; // OV3660 starts at QXGA.
+  if (sensor->id.PID == OV5640_PID) {
+    start = qsxgaInitSucceeded ? 0 : (qxgaInitSucceeded ? 1 : 2);
+  } else if (!qxgaInitSucceeded) {
+    start = 2;
+  }
+  for (int stage = start; stage < 7; ++stage) {
     if (sensor->set_framesize(sensor, frameSizes[stage]) != 0) continue;
     sensor->set_quality(sensor, PHOTO_JPEG_QUALITY);
     flushCameraFrames(CAMERA_FB_COUNT);
