@@ -63,13 +63,6 @@ public class MainActivity extends Activity {
     private boolean connectedReady = false;
     private int notifyStage = 0;
 
-    // Samsung/Android can occasionally reject the first fresh GATT attempt
-    // immediately after the ESP32 begins advertising. Retry exactly once before
-    // reporting a disconnect to the UI.
-    private BluetoothDevice pendingGattDevice;
-    private int gattConnectAttempt = 0;
-    private boolean allowGattAutoRetry = false;
-
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         BluetoothManager manager = (BluetoothManager)getSystemService(Context.BLUETOOTH_SERVICE);
@@ -151,16 +144,7 @@ public class MainActivity extends Activity {
     private void connectDevice(BluetoothDevice device) {
         try { if (scanner != null) scanner.stopScan(scanCallback); } catch (Exception ignored) {}
         scanner = null;
-        pendingGattDevice = device;
-        gattConnectAttempt = 1;
-        allowGattAutoRetry = true;
         jsMessage("Connecting…");
-        openGatt(device);
-    }
-
-    @SuppressWarnings("MissingPermission")
-    private void openGatt(BluetoothDevice device) {
-        if (device == null) return;
         if (Build.VERSION.SDK_INT >= 23) gatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
         else gatt = device.connectGatt(this, false, gattCallback);
     }
@@ -172,30 +156,10 @@ public class MainActivity extends Activity {
                 try { g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH); } catch (Exception ignored) {}
                 g.discoverServices();
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                final boolean retry =
-                        allowGattAutoRetry &&
-                        !connectedReady &&
-                        gattConnectAttempt == 1 &&
-                        pendingGattDevice != null;
-
                 connectedReady = false; notifyStage = 0; commandChar = statusChar = dataChar = null;
+                js("window.onNativeDisconnected&&window.onNativeDisconnected()");
                 try { g.close(); } catch (Exception ignored) {}
                 if (gatt == g) gatt = null;
-
-                if (retry) {
-                    gattConnectAttempt = 2;
-                    jsMessage("First GATT attempt failed — retrying…");
-                    handler.postDelayed(() -> {
-                        if (allowGattAutoRetry && !connectedReady && pendingGattDevice != null) {
-                            openGatt(pendingGattDevice);
-                        }
-                    }, 700);
-                    return;
-                }
-
-                allowGattAutoRetry = false;
-                pendingGattDevice = null;
-                js("window.onNativeDisconnected&&window.onNativeDisconnected()");
             }
         }
 
@@ -226,8 +190,6 @@ public class MainActivity extends Activity {
         else {
             if (!connectedReady) {
                 connectedReady = true;
-                allowGattAutoRetry = false;
-                pendingGattDevice = null;
                 js("window.onNativeConnected&&window.onNativeConnected()");
             }
             return;
@@ -270,9 +232,6 @@ public class MainActivity extends Activity {
 
     @SuppressWarnings("MissingPermission")
     private void disconnectGatt() {
-        allowGattAutoRetry = false;
-        pendingGattDevice = null;
-        gattConnectAttempt = 0;
         connectedReady = false; notifyStage = 0;
         try { if (scanner != null) scanner.stopScan(scanCallback); } catch (Exception ignored) {}
         scanner = null;
