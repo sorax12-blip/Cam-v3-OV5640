@@ -1,0 +1,88 @@
+name: Build ESP32 Cam HD Full exFAT Firmware
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - esp32-cam-hd-s26-fix
+    paths:
+      - 'firmware/esp32-cam-hd-full-exfat/**'
+      - '.github/workflows/build-full-exfat-firmware.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build full ESP32-S3 camera firmware
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.5
+          target: esp32s3
+          path: firmware/esp32-cam-hd-full-exfat
+          command: >-
+            rm -rf /tmp/esp32-arduino-lib-builder &&
+            git clone --depth 1 https://github.com/espressif/esp32-arduino-lib-builder.git /tmp/esp32-arduino-lib-builder &&
+            mkdir -p components &&
+            cp -a /tmp/esp32-arduino-lib-builder/components/arduino_tinyusb components/arduino_tinyusb &&
+            git clone --depth 1 https://github.com/hathach/tinyusb.git components/arduino_tinyusb/tinyusb &&
+            bash prepare_exfat_component.sh &&
+            idf.py set-target esp32s3 &&
+            idf.py build &&
+            esptool.py --chip esp32s3 merge_bin
+            -o build/ESP32_Cam_HD_FULL_exFAT_MERGED.bin
+            0x0 build/bootloader/bootloader.bin
+            0x8000 build/partition_table/partition-table.bin
+            0x10000 build/esp32_cam_hd_full_exfat.bin
+
+      - name: Collect firmware
+        shell: bash
+        run: |
+          mkdir -p firmware/esp32-cam-hd-full-exfat/artifact
+          cp firmware/esp32-cam-hd-full-exfat/build/ESP32_Cam_HD_FULL_exFAT_MERGED.bin firmware/esp32-cam-hd-full-exfat/artifact/
+          cp firmware/esp32-cam-hd-full-exfat/build/esp32_cam_hd_full_exfat.bin firmware/esp32-cam-hd-full-exfat/artifact/
+          cp firmware/esp32-cam-hd-full-exfat/build/bootloader/bootloader.bin firmware/esp32-cam-hd-full-exfat/artifact/
+          cp firmware/esp32-cam-hd-full-exfat/build/partition_table/partition-table.bin firmware/esp32-cam-hd-full-exfat/artifact/
+          cp firmware/esp32-cam-hd-full-exfat/build/flash_args firmware/esp32-cam-hd-full-exfat/artifact/ 2>/dev/null || true
+          cat > firmware/esp32-cam-hd-full-exfat/artifact/FLASH_INFO.txt <<'EOF'
+          ESP32 Cam HD FULL exFAT Firmware
+          Target: ESP32-S3 N16R8
+          ESP-IDF: 5.5.5
+          Arduino-ESP32: 3.3.12
+          Flash: 16 MB
+          PSRAM: 8 MB Octal
+
+          PHONE FLASHING:
+            File: ESP32_Cam_HD_FULL_exFAT_MERGED.bin
+            Address: 0x0
+            Flash through the board connector labeled USB-UART.
+
+          NORMAL USB STORAGE:
+            Use the board connector labeled USB-OTG.
+            Direct USB-C male to USB-C male is supported.
+            USB mass storage is READ-ONLY in this full camera firmware.
+
+          SD:
+            exFAT supported
+            CLK GPIO39 / CMD GPIO38 / D0 GPIO40 / 1-bit SDMMC
+
+          BLE:
+            Device: ESP32 Cam HD
+            Button: GPIO21 to GND
+            Blue LED: GPIO47
+            Live default: HVGA 480x320 / JPEG Q20 / 250 ms target
+
+          CAMERA:
+            OV3660 and OV5640 PID auto-detect
+            Saved photos: QXGA 2048x1536 / JPEG Q4 current shared profile
+          EOF
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ESP32-Cam-HD-FULL-exFAT
+          path: firmware/esp32-cam-hd-full-exfat/artifact/
+          if-no-files-found: error
