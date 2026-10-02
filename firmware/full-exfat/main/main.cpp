@@ -265,6 +265,11 @@ static uint32_t bleLiveFrameIntervalMs = BLE_LIVE_DEFAULT_FRAME_INTERVAL_MS;
 static bool bleModeActive = false;
 static volatile bool bleClientConnected = false;
 static volatile bool bleClientDisconnectedEvent = false;
+
+// A low-level BLE link can briefly connect and drop before Android/Web Bluetooth
+// finishes GATT discovery. Do not treat that as a completed user session.
+static volatile bool bleGattSessionEstablished = false;
+static volatile bool bleRestartAdvertisingPending = false;
 static BLEServer* bleServer = nullptr;
 static BLECharacteristic* bleStatusCharacteristic = nullptr;
 static BLECharacteristic* bleDataCharacteristic = nullptr;
@@ -323,10 +328,22 @@ class V3BleServerCallbacks : public BLEServerCallbacks {
 
   void onDisconnect(BLEServer* server) override {
     bleClientConnected = false;
-    bleClientDisconnectedEvent = true;
     blueLedState = false;
     digitalWrite(BLUE_BLE_LED_PIN, LOW);
-    Serial.println("BLE client disconnected; BLE session will close and capture will resume");
+
+    if (bleGattSessionEstablished) {
+      // A real viewer session reached the command channel. Preserve the normal
+      // behavior: end BLE and resume camera capture after disconnect.
+      bleClientDisconnectedEvent = true;
+      Serial.println("BLE client disconnected after active GATT session; BLE will close");
+    } else {
+      // Android/Web Bluetooth may create a short-lived first connection that
+      // dies during GATT discovery. Keep BLE alive and advertise again so the
+      // automatic/manual second attempt can succeed.
+      bleClientDisconnectedEvent = false;
+      bleRestartAdvertisingPending = true;
+      Serial.println("BLE transient GATT disconnect before session setup; re-advertising");
+    }
   }
 };
 
@@ -334,6 +351,10 @@ class V3BleCommandCallbacks : public BLECharacteristicCallbacks {
  public:
   void onWrite(BLECharacteristic* characteristic) override {
     if (!bleCommandQueue) return;
+
+    // Reaching this characteristic proves Android completed the GATT handshake.
+    bleGattSessionEstablished = true;
+
     String value = characteristic->getValue();
     value.trim();
     if (value.length() == 0) return;
@@ -1768,6 +1789,8 @@ static bool startBluetoothBrowser() {
 
   bleClientConnected = false;
   bleClientDisconnectedEvent = false;
+  bleGattSessionEstablished = false;
+  bleRestartAdvertisingPending = false;
   bleLiveModeActive = false;
   bleLiveFrameId = 0;
   bleNextLiveFrameDueMs = 0;
@@ -1817,6 +1840,8 @@ static void stopBluetoothBrowser() {
   bleModeActive = false;
   bleClientConnected = false;
   bleClientDisconnectedEvent = false;
+  bleGattSessionEstablished = false;
+  bleRestartAdvertisingPending = false;
   bleAdvertisingStartedMs = 0;
   bleServer = nullptr;
   bleStatusCharacteristic = nullptr;
@@ -1973,6 +1998,17 @@ void loop() {
     processBluetoothCommands();
     if (bleLiveModeActive) bleUpdateLivePreview();
     updateBluetoothBlueLed();
+
+    if (bleRestartAdvertisingPending && !bleClientConnected) {
+      bleRestartAdvertisingPending = false;
+
+      // Only restart within the original 30-second connection window.
+      if (bleAdvertisingStartedMs != 0 &&
+          (uint32_t)(millis() - bleAdvertisingStartedMs) < BLE_ADVERTISING_TIMEOUT_MS) {
+        BLEDevice::startAdvertising();
+        Serial.println("BLE advertising restarted after transient first GATT failure");
+      }
+    }
 
     if (bleClientDisconnectedEvent && !bleClientConnected) {
       Serial.println("BLE client session ended; shutting Bluetooth off");
