@@ -122,6 +122,13 @@ static const int BLE_MOMENTARY_BUTTON_PIN = 21;
 static constexpr uint32_t BLE_BUTTON_DEBOUNCE_MS = 250;
 static constexpr uint32_t BLE_ADVERTISING_TIMEOUT_MS = 30000;
 
+// BLE startup guard times. Android/Web Bluetooth can see an advertisement
+// before the Bluedroid/GATT server is fully ready if advertising begins
+// immediately after init/service creation. The symptom is a first-attempt
+// "GATT operation failed" followed by a successful second attempt.
+static constexpr uint32_t BLE_CONTROLLER_SETTLE_MS = 250;
+static constexpr uint32_t BLE_GATT_SETTLE_MS = 250;
+
 // 4 complete blue flashes per second = 250 ms per flash cycle, so toggle the
 // LED every 125 ms for a 50% duty cycle while advertising.
 static constexpr uint32_t BLUE_LED_TOGGLE_MS = 125;
@@ -1720,6 +1727,11 @@ static bool startBluetoothBrowser() {
   BLEDevice::init(BLE_DEVICE_NAME);
   BLEDevice::setMTU(247);
 
+  // Let the controller/host stack finish coming up before creating the GATT
+  // server. This specifically avoids the repeatable first-connect failure seen
+  // on Samsung/Web Bluetooth after BLE is toggled on.
+  delay(BLE_CONTROLLER_SETTLE_MS);
+
   bleServer = BLEDevice::createServer();
   if (!bleServer) {
     Serial.println("BLE server creation failed");
@@ -1749,10 +1761,10 @@ static bool startBluetoothBrowser() {
   bleDataCharacteristic->addDescriptor(new BLE2902());
 
   service->start();
-  BLEAdvertising* advertising = bleServer->getAdvertising();
-  advertising->addServiceUUID(BLE_SERVICE_UUID);
-  advertising->setScanResponse(true);
-  advertising->start();
+
+  // Do not advertise a half-settled GATT database. Android may attempt service
+  // discovery immediately after seeing the advertisement.
+  delay(BLE_GATT_SETTLE_MS);
 
   bleClientConnected = false;
   bleClientDisconnectedEvent = false;
@@ -1760,6 +1772,13 @@ static bool startBluetoothBrowser() {
   bleLiveFrameId = 0;
   bleNextLiveFrameDueMs = 0;
   bleModeActive = true;
+
+  BLEAdvertising* advertising = bleServer->getAdvertising();
+  advertising->addServiceUUID(BLE_SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->start();
+
+  // The 30-second connection window begins only once advertising is actually on.
   bleAdvertisingStartedMs = millis();
   blueLedLastToggleMs = bleAdvertisingStartedMs;
   blueLedState = false;
