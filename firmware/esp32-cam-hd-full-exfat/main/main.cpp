@@ -6,13 +6,13 @@ struct BleIndexStats;  // Forward declaration for Arduino .ino auto-generated pr
  *
  * Capture behavior:
  *   MONITORING MODE
- *   - Every 10 seconds, capture 5 low-resolution comparison frames in rapid
+ *   - Every 7.5 seconds, capture 5 low-resolution comparison frames in rapid
  *     succession. These frames are NEVER written to the SD card.
  *   - The 5 frames are reduced to coarse grayscale signatures and compared.
  *   - If the average changed-area score is >= 10%, enter EVENT CAPTURE mode.
  *
  *   EVENT CAPTURE MODE
- *   - Save one full-quality photo every 750 ms.
+ *   - Save one full-quality photo every 600 ms.
  *   - After 2 minutes of event photos, stop briefly and capture another 5-frame
  *     comparison burst (also not saved).
  *   - If the comparison score is still >= 10%, continue for another 2-minute
@@ -33,7 +33,7 @@ struct BleIndexStats;  // Forward declaration for Arduino .ino auto-generated pr
  *   - OV5640 uses its maximum esp32-camera supported still size,
  *     2560x1920 (QSXGA), JPEG quality 4.
  *   - Existing /Photos/00001... folder and F#_Pic_#.JPG naming is retained.
- *   - Each numbered folder holds up to 1,600 photos (10 full 2-minute event blocks).
+ *   - Each numbered folder holds up to 2,000 photos (10 full 2-minute event blocks).
  *   - Video recording has been removed completely.
  *
  * Bluetooth LE SD browser:
@@ -133,14 +133,14 @@ static constexpr uint32_t GREEN_LED_OFF_MS = 167;
 // -------------------------------------------------------------------------
 
 // Motion / event capture timing.
-static constexpr uint32_t MOTION_CHECK_INTERVAL_MS = 10000;
+static constexpr uint32_t MOTION_CHECK_INTERVAL_MS = 7500;
 static constexpr uint8_t MOTION_COMPARE_FRAMES = 5;
 static constexpr float MOTION_TRIGGER_PERCENT = 10.0f;
 static constexpr uint8_t MOTION_CELL_BRIGHTNESS_DELTA = 18;
-static constexpr uint32_t EVENT_PHOTO_INTERVAL_MS = 750;
+static constexpr uint32_t EVENT_PHOTO_INTERVAL_MS = 600;
 static constexpr uint32_t EVENT_RECHECK_INTERVAL_MS = 120000;
-// One uninterrupted 2-minute block nominally saves 160 photos:
-// t=0, 0.75 s, ... 119.25 s, then the 120 s comparison takes priority.
+// One uninterrupted 2-minute block nominally saves 200 photos:
+// t=0, 0.60 s, ... 119.40 s, then the 120 s comparison takes priority.
 static constexpr uint32_t PHOTOS_PER_EVENT_BLOCK =
     EVENT_RECHECK_INTERVAL_MS / EVENT_PHOTO_INTERVAL_MS;
 
@@ -164,14 +164,14 @@ static constexpr uint32_t BATTERY_ACTIVE_CPU_MHZ = 240;
 static constexpr bool BATTERY_CAMERA_LOW_RATE_BETWEEN_PHOTOS = true;
 static constexpr uint32_t BATTERY_IDLE_SLICE_MS = 100;
 // -------------------------------------------------------------------------
-// 1,600 photos per folder = 10 complete 2-minute event blocks at
-// one saved photo every 750 ms (160 photos per 2-minute block).
-// If a new/restarted block would begin with fewer than 160 slots left in the
+// 2,000 photos per folder = 10 complete 2-minute event blocks at
+// one saved photo every 600 ms (200 photos per 2-minute block).
+// If a new/restarted block would begin with fewer than 200 slots left in the
 // current folder, those remaining numbers are intentionally skipped and the
-// next block starts at the first number of the next folder. Exactly 160 free
+// next block starts at the first number of the next folder. Exactly 200 free
 // slots is allowed so a complete nominal 2-minute block can still fit.
-static constexpr uint32_t PHOTOS_PER_FOLDER = 1600;
-static_assert(PHOTOS_PER_EVENT_BLOCK == 160, "2-minute block math changed");
+static constexpr uint32_t PHOTOS_PER_FOLDER = 2000;
+static_assert(PHOTOS_PER_EVENT_BLOCK == 200, "2-minute block math changed");
 static_assert((PHOTOS_PER_FOLDER % PHOTOS_PER_EVENT_BLOCK) == 0,
               "Folder size must contain whole event blocks");
 static constexpr uint32_t MAX_MEDIA_FOLDERS = 99999;
@@ -183,6 +183,9 @@ static constexpr uint32_t MAX_PHOTO_NUMBER = MAX_MEDIA_FOLDERS * PHOTOS_PER_FOLD
 static constexpr uint8_t PHOTO_JPEG_QUALITY = 4;
 static constexpr framesize_t OV3660_SAVED_FRAME_SIZE = FRAMESIZE_QXGA;
 static constexpr framesize_t OV5640_SAVED_FRAME_SIZE = FRAMESIZE_QSXGA;
+// EXIF orientation 8 = display 90 degrees counter-clockwise.
+// This rotates presentation without decoding/re-encoding the 5 MP JPEG.
+static constexpr uint16_t OV5640_SAVED_EXIF_ORIENTATION = 8;
 static constexpr uint8_t CAMERA_FB_COUNT = 3;
 
 static const char* PHOTO_ROOT = "/Photos";
@@ -558,10 +561,10 @@ static void exitUsbMassStorageMode() {
     eventBlockStartedMs = now;
     eventPhotosThisBlock = 0;
     nextEventPhotoDueMs = now + EVENT_PHOTO_INTERVAL_MS;
-    Serial.println("USB host disconnected: EVENT capture resumes in 750 ms; 2-minute block restarted");
+    Serial.println("USB host disconnected: EVENT capture resumes in 600 ms; 2-minute block restarted");
   } else {
     nextMotionCheckDueMs = now + MOTION_CHECK_INTERVAL_MS;
-    Serial.println("USB host disconnected: MONITORING resumes; next 5-frame check in 10 seconds");
+    Serial.println("USB host disconnected: MONITORING resumes; next 5-frame check in 7.5 seconds");
   }
   batteryEnterIdlePower();
 }
@@ -687,11 +690,11 @@ static uint32_t scanNextPhotoNumber() {
 }
 
 // Keep each newly started/restarted 2-minute block inside one folder whenever
-// possible. If the current folder has fewer than 160 unused photo numbers
+// possible. If the current folder has fewer than 200 unused photo numbers
 // remaining, abandon those remaining numbers and begin at the next folder's
-// first number. Exactly 160 remaining slots is valid and is used for one full
-// block. Example: after F1_Pic_1440.JPG, the next photo remains 1441; after
-// F1_Pic_1441.JPG, the next number becomes 1601.
+// first number. Exactly 200 remaining slots is valid and is used for one full
+// block. Example: after F1_Pic_1800.JPG, the next photo remains 1801; after
+// F1_Pic_1801.JPG, the next number becomes 2001.
 static bool advanceToFreshFolderIfNeeded(const char* reason) {
   if (nextPhotoNumber < 1 || nextPhotoNumber > MAX_PHOTO_NUMBER) return false;
 
@@ -701,7 +704,7 @@ static bool advanceToFreshFolderIfNeeded(const char* reason) {
   const uint32_t slotsRemaining = folderLast - nextPhotoNumber + 1;
 
   // A brand-new folder should never be skipped. Otherwise, reserve enough room
-  // for a complete nominal 2-minute / 160-photo block.
+  // for a complete nominal 2-minute / 200-photo block.
   if (nextPhotoNumber != folderFirst && slotsRemaining < PHOTOS_PER_EVENT_BLOCK) {
     if (folder >= MAX_MEDIA_FOLDERS) {
       Serial.println("Folder reserve rule reached maximum media folder; cannot advance");
@@ -816,8 +819,10 @@ static void cameraBegin() {
     s->set_hmirror(s, 0);
   } else if (detectedCameraSensor == CAMERA_SENSOR_OV5640) {
     // OV5640 saved stills use the sensor's maximum esp32-camera profile:
-    // QSXGA 2560x1920 at JPEG Q4. Orientation stays at the known baseline.
-    s->set_vflip(s, 0);
+    // QSXGA 2560x1920 at JPEG Q4. Apply vertical flip at the sensor.
+    // A 90-degree counter-clockwise display orientation is added to saved
+    // JPEGs via EXIF so burst timing is not penalized by 5 MP re-encoding.
+    s->set_vflip(s, 1);
     s->set_hmirror(s, 0);
   } else {
     Serial.printf("WARNING: unsupported/unrecognized camera PID 0x%x; using generic fallback behavior\n",
@@ -909,6 +914,51 @@ static camera_fb_t* getHighestResolutionFrame() {
   return nullptr;
 }
 
+// Save a camera JPEG. OV5640 files receive a minimal EXIF Orientation tag
+// (value 8 = 90 degrees counter-clockwise for display) immediately after the
+// JPEG SOI marker. Pixel data is left untouched, avoiding an expensive 5 MP
+// decode/rotate/re-encode pass that would make the 600-ms burst target impossible.
+static bool writeSavedJpeg(File& output, const camera_fb_t* frame, size_t& savedBytes) {
+  savedBytes = 0;
+  if (!output || !frame || !frame->buf || frame->len < 2) return false;
+
+  if (detectedCameraSensor != CAMERA_SENSOR_OV5640) {
+    savedBytes = output.write(frame->buf, frame->len);
+    return savedBytes == frame->len;
+  }
+
+  if (frame->buf[0] != 0xFF || frame->buf[1] != 0xD8) {
+    Serial.println("OV5640 JPEG missing SOI marker; saving without EXIF rotation tag");
+    savedBytes = output.write(frame->buf, frame->len);
+    return savedBytes == frame->len;
+  }
+
+  // JPEG APP1 Exif segment, little-endian TIFF, one Orientation SHORT entry.
+  // APP1 length = 0x0022 (34 bytes including its two-byte length field).
+  static const uint8_t exifOrientation90Ccw[] = {
+    0xFF, 0xE1, 0x00, 0x22,
+    0x45, 0x78, 0x69, 0x66, 0x00, 0x00,       // "Exif\0\0"
+    0x49, 0x49, 0x2A, 0x00,                   // little-endian TIFF header
+    0x08, 0x00, 0x00, 0x00,                   // IFD0 offset
+    0x01, 0x00,                               // one IFD entry
+    0x12, 0x01,                               // tag 0x0112: Orientation
+    0x03, 0x00,                               // type SHORT
+    0x01, 0x00, 0x00, 0x00,                   // count = 1
+    (uint8_t)OV5640_SAVED_EXIF_ORIENTATION, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00                    // no next IFD
+  };
+
+  const size_t a = output.write(frame->buf, 2);
+  const size_t b = output.write(exifOrientation90Ccw, sizeof(exifOrientation90Ccw));
+  const size_t d = output.write(frame->buf + 2, frame->len - 2);
+  savedBytes = a + b + d;
+
+  return a == 2 &&
+         b == sizeof(exifOrientation90Ccw) &&
+         d == (frame->len - 2) &&
+         savedBytes == frame->len + sizeof(exifOrientation90Ccw);
+}
+
 static bool capturePhoto() {
   if (!sdReady || !cameraReady) {
     Serial.println("Photo skipped: camera or card unavailable");
@@ -943,16 +993,18 @@ static bool capturePhoto() {
 
   File output = SD_MMC.open(fileName, FILE_WRITE);
   bool ok = false;
+  size_t savedBytes = 0;
   if (output) {
-    const size_t written = output.write(frame->buf, frame->len);
+    ok = writeSavedJpeg(output, frame, savedBytes);
     output.flush();
     output.close();
-    ok = (written == frame->len);
   }
 
-  Serial.printf("%s %s (%ux%u, %u bytes)\n",
+  Serial.printf("%s %s (%ux%u, %u bytes%s)\n",
                 ok ? "SAVED" : "FAILED", fileName,
-                frame->width, frame->height, (unsigned)frame->len);
+                frame->width, frame->height, (unsigned)savedBytes,
+                (detectedCameraSensor == CAMERA_SENSOR_OV5640)
+                    ? ", EXIF rotate 90 CCW" : "");
   esp_camera_fb_return(frame);
 
   if (!ok) {
@@ -1858,10 +1910,10 @@ static void stopBluetoothBrowser() {
     eventBlockStartedMs = now;
     eventPhotosThisBlock = 0;
     nextEventPhotoDueMs = now + EVENT_PHOTO_INTERVAL_MS;
-    Serial.println("BLE mode OFF: EVENT capture resumes in 750 ms; 2-minute block restarted");
+    Serial.println("BLE mode OFF: EVENT capture resumes in 600 ms; 2-minute block restarted");
   } else {
     nextMotionCheckDueMs = now + MOTION_CHECK_INTERVAL_MS;
-    Serial.println("BLE mode OFF: MONITORING resumes; next 5-frame check in 10 seconds");
+    Serial.println("BLE mode OFF: MONITORING resumes; next 5-frame check in 7.5 seconds");
   }
   batteryEnterIdlePower();
 }
@@ -1959,7 +2011,7 @@ void setup() {
   nextEventPhotoDueMs = 0;
   eventBlockStartedMs = 0;
   eventPhotosThisBlock = 0;
-  Serial.println("MONITORING mode active; first 5-frame comparison in 10 seconds");
+  Serial.println("MONITORING mode active; first 5-frame comparison in 7.5 seconds");
 }
 
 void loop() {
@@ -2037,7 +2089,7 @@ void loop() {
       const bool valid = cameraReady && runMotionComparison(averagePct, peakPct);
 
       if (valid && averagePct >= MOTION_TRIGGER_PERCENT) {
-        // Never start a fresh 2-minute block when fewer than 160 slots remain
+        // Never start a fresh 2-minute block when fewer than 200 slots remain
         // in a partially used folder. This also handles a prior interrupted block.
         advanceToFreshFolderIfNeeded("new motion block");
         captureMode = CAPTURE_MODE_EVENT;
@@ -2050,7 +2102,7 @@ void loop() {
         if (!valid) Serial.println("Motion comparison invalid; staying in MONITORING mode");
         batteryCameraIdleMode();
         batteryEnterIdlePower();
-        // Keep approximately 10 seconds between starts of comparison bursts.
+        // Keep approximately 7.5 seconds between starts of comparison bursts.
         nextMotionCheckDueMs = checkStartedMs + MOTION_CHECK_INTERVAL_MS;
         if ((int32_t)(millis() - nextMotionCheckDueMs) >= 0) {
           nextMotionCheckDueMs = millis() + MOTION_CHECK_INTERVAL_MS;
@@ -2104,13 +2156,13 @@ void loop() {
       }
 
       // Keep full-resolution camera mode during EVENT capture so the next shot
-      // does not pay the resolution-switch/flush penalty every 750 ms.
+      // does not pay the resolution-switch/flush penalty every 600 ms.
       batteryEnterIdlePower();
 
       nextEventPhotoDueMs += EVENT_PHOTO_INTERVAL_MS;
-      // If capture + SD write itself exceeds 750 ms, the requested cadence is
+      // If capture + SD write itself exceeds 600 ms, the requested cadence is
       // physically impossible. Start the next shot immediately rather than
-      // adding another 750-ms delay, so event capture runs as fast as hardware allows.
+      // adding another 600-ms delay, so event capture runs as fast as hardware allows.
       if ((int32_t)(millis() - nextEventPhotoDueMs) >= 0) {
         const uint32_t elapsed = millis() - photoStartedMs;
         Serial.printf("Event photo cadence overrun: operation took %u ms; target is %u ms; next shot ASAP\n",
