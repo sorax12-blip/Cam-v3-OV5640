@@ -317,11 +317,12 @@ public class MainActivity extends Activity {
 
     private void applySafeAreaToWeb() {
         if (webView == null) return;
-        final int top = safeTopInset;
-        final int bottom = safeBottomInset;
+        float density = getResources().getDisplayMetrics().density;
+        final int topCss = Math.round(safeTopInset / density);
+        final int bottomCss = Math.round(safeBottomInset / density);
         handler.post(() -> webView.evaluateJavascript(
-            "document.documentElement.style.setProperty('--native-safe-top','" + top + "px');" +
-            "document.documentElement.style.setProperty('--native-safe-bottom','" + bottom + "px');",
+            "document.documentElement.style.setProperty('--native-safe-top','" + topCss + "px');" +
+            "document.documentElement.style.setProperty('--native-safe-bottom','" + bottomCss + "px');",
             null));
     }
 
