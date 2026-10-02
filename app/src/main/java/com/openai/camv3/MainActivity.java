@@ -236,16 +236,30 @@ public class MainActivity extends Activity {
         }
     }
 
-    @SuppressWarnings("MissingPermission")
     private void sendCommand(String text) {
         if (!connectedReady || gatt == null || commandChar == null) { jsMessage("Camera is not connected yet."); return; }
-        byte[] value = text.getBytes(StandardCharsets.UTF_8);
+        commandQueue.addLast(text.getBytes(StandardCharsets.UTF_8));
+        drainCommandQueue();
+    }
+
+    @SuppressWarnings("MissingPermission")
+    private void drainCommandQueue() {
+        if (commandWriteInProgress || !connectedReady || gatt == null || commandChar == null || commandQueue.isEmpty()) return;
+        byte[] value = commandQueue.peekFirst();
+        boolean started;
         if (Build.VERSION.SDK_INT >= 33) {
-            gatt.writeCharacteristic(commandChar, value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            started = gatt.writeCharacteristic(commandChar, value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == 0;
         } else {
             commandChar.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
             commandChar.setValue(value);
-            gatt.writeCharacteristic(commandChar);
+            started = gatt.writeCharacteristic(commandChar);
+        }
+        if (started) {
+            commandWriteInProgress = true;
+        } else {
+            commandQueue.pollFirst();
+            jsMessage("BLE command write could not start.");
+            drainCommandQueue();
         }
     }
 
