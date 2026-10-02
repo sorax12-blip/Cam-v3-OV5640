@@ -42,6 +42,7 @@ import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.UUID;
 
@@ -62,6 +63,8 @@ public class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean connectedReady = false;
     private int notifyStage = 0;
+    private final ArrayDeque<byte[]> commandQueue = new ArrayDeque<>();
+    private boolean commandWriteInProgress = false;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -180,6 +183,16 @@ public class MainActivity extends Activity {
         @Override public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic c) { handleNotification(c.getUuid(), c.getValue()); }
 
         @Override public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic c, byte[] value) { handleNotification(c.getUuid(), value); }
+
+        @Override public void onCharacteristicWrite(BluetoothGatt g, BluetoothGattCharacteristic c, int status) {
+            if (!COMMAND_UUID.equals(c.getUuid())) return;
+            handler.post(() -> {
+                if (!commandQueue.isEmpty()) commandQueue.pollFirst();
+                commandWriteInProgress = false;
+                if (status != BluetoothGatt.GATT_SUCCESS) jsMessage("BLE command write failed: " + status);
+                drainCommandQueue();
+            });
+        }
     };
 
     @SuppressWarnings("MissingPermission")
@@ -208,12 +221,18 @@ public class MainActivity extends Activity {
         if (STATUS_UUID.equals(uuid)) {
             String s = new String(value, StandardCharsets.UTF_8);
             js("window.onNativeStatus&&window.onNativeStatus(" + JSONObject.quote(s) + ")");
-        } else if (DATA_UUID.equals(uuid) && value.length >= 4) {
-            int offset = ByteBuffer.wrap(value, 0, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
-            byte[] payload = new byte[value.length - 4];
-            System.arraycopy(value, 4, payload, 0, payload.length);
-            String b64 = Base64.encodeToString(payload, Base64.NO_WRAP);
-            js("window.onNativeData&&window.onNativeData(" + (offset & 0xffffffffL) + "," + JSONObject.quote(b64) + ")");
+        } else if (DATA_UUID.equals(uuid)) {
+            String rawB64 = Base64.encodeToString(value, Base64.NO_WRAP);
+            if (value.length >= 4) {
+                int offset = ByteBuffer.wrap(value, 0, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+                byte[] payload = new byte[value.length - 4];
+                System.arraycopy(value, 4, payload, 0, payload.length);
+                String payloadB64 = Base64.encodeToString(payload, Base64.NO_WRAP);
+                js("if(window.onNativeDataRaw){window.onNativeDataRaw(" + JSONObject.quote(rawB64) + ");}" +
+                   "else if(window.onNativeData){window.onNativeData(" + (offset & 0xffffffffL) + "," + JSONObject.quote(payloadB64) + ");}");
+            } else {
+                js("window.onNativeDataRaw&&window.onNativeDataRaw(" + JSONObject.quote(rawB64) + ")");
+            }
         }
     }
 
@@ -232,7 +251,7 @@ public class MainActivity extends Activity {
 
     @SuppressWarnings("MissingPermission")
     private void disconnectGatt() {
-        connectedReady = false; notifyStage = 0;
+        connectedReady = false; notifyStage = 0; commandQueue.clear(); commandWriteInProgress = false;
         try { if (scanner != null) scanner.stopScan(scanCallback); } catch (Exception ignored) {}
         scanner = null;
         if (gatt != null) { try { gatt.disconnect(); gatt.close(); } catch (Exception ignored) {} gatt = null; }
