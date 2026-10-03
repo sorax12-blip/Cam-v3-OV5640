@@ -186,6 +186,22 @@ static constexpr framesize_t OV5640_SAVED_FRAME_SIZE = FRAMESIZE_QSXGA;
 // EXIF orientation 8 = display 90 degrees counter-clockwise.
 // This rotates presentation without decoding/re-encoding the 5 MP JPEG.
 static constexpr uint16_t OV5640_SAVED_EXIF_ORIENTATION = 8;
+
+// Shared minimal JPEG APP1 Exif segment.
+// Orientation 8 = display 90 degrees counter-clockwise.
+static const uint8_t OV5640_EXIF_ORIENTATION_90_CCW[] = {
+  0xFF, 0xE1, 0x00, 0x22,
+  0x45, 0x78, 0x69, 0x66, 0x00, 0x00,       // "Exif\0\0"
+  0x49, 0x49, 0x2A, 0x00,                   // little-endian TIFF header
+  0x08, 0x00, 0x00, 0x00,                   // IFD0 offset
+  0x01, 0x00,                               // one IFD entry
+  0x12, 0x01,                               // tag 0x0112: Orientation
+  0x03, 0x00,                               // type SHORT
+  0x01, 0x00, 0x00, 0x00,                   // count = 1
+  (uint8_t)OV5640_SAVED_EXIF_ORIENTATION, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00                    // no next IFD
+};
+
 static constexpr uint8_t CAMERA_FB_COUNT = 3;
 
 static const char* PHOTO_ROOT = "/Photos";
@@ -935,28 +951,16 @@ static bool writeSavedJpeg(File& output, const camera_fb_t* frame, size_t& saved
 
   // JPEG APP1 Exif segment, little-endian TIFF, one Orientation SHORT entry.
   // APP1 length = 0x0022 (34 bytes including its two-byte length field).
-  static const uint8_t exifOrientation90Ccw[] = {
-    0xFF, 0xE1, 0x00, 0x22,
-    0x45, 0x78, 0x69, 0x66, 0x00, 0x00,       // "Exif\0\0"
-    0x49, 0x49, 0x2A, 0x00,                   // little-endian TIFF header
-    0x08, 0x00, 0x00, 0x00,                   // IFD0 offset
-    0x01, 0x00,                               // one IFD entry
-    0x12, 0x01,                               // tag 0x0112: Orientation
-    0x03, 0x00,                               // type SHORT
-    0x01, 0x00, 0x00, 0x00,                   // count = 1
-    (uint8_t)OV5640_SAVED_EXIF_ORIENTATION, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00                    // no next IFD
-  };
-
   const size_t a = output.write(frame->buf, 2);
-  const size_t b = output.write(exifOrientation90Ccw, sizeof(exifOrientation90Ccw));
+  const size_t b = output.write(OV5640_EXIF_ORIENTATION_90_CCW,
+                                sizeof(OV5640_EXIF_ORIENTATION_90_CCW));
   const size_t d = output.write(frame->buf + 2, frame->len - 2);
   savedBytes = a + b + d;
 
   return a == 2 &&
-         b == sizeof(exifOrientation90Ccw) &&
+         b == sizeof(OV5640_EXIF_ORIENTATION_90_CCW) &&
          d == (frame->len - 2) &&
-         savedBytes == frame->len + sizeof(exifOrientation90Ccw);
+         savedBytes == frame->len + sizeof(OV5640_EXIF_ORIENTATION_90_CCW);
 }
 
 static bool capturePhoto() {
@@ -1529,6 +1533,7 @@ static void bleSendLiveInfo() {
   info += " height=" + String(bleLiveHeight);
   info += " quality=" + String(bleLiveJpegQuality);
   info += " interval=" + String(bleLiveFrameIntervalMs);
+  if (detectedCameraSensor == CAMERA_SENSOR_OV5640) info += " rotation=CCW90";
   info += bleLiveModeActive ? " state=ON" : " state=OFF";
   bleSendStatus(info);
 }
@@ -1628,10 +1633,11 @@ static bool bleStartLivePreview() {
   status += " " + String(bleLiveJpegQuality);
   status += " " + String(bleLiveFrameIntervalMs);
   bleSendStatus(status);
-  Serial.printf("BLE LIVE ON: %s %ux%u Q%u target=%lu ms; frames unsaved; normal capture paused\n",
+  Serial.printf("BLE LIVE ON: %s %ux%u Q%u target=%lu ms%s; frames unsaved; normal capture paused\n",
                 bleLiveProfileName(bleLiveFrameSize),
                 (unsigned)bleLiveWidth, (unsigned)bleLiveHeight,
-                (unsigned)bleLiveJpegQuality, (unsigned long)bleLiveFrameIntervalMs);
+                (unsigned)bleLiveJpegQuality, (unsigned long)bleLiveFrameIntervalMs,
+                (detectedCameraSensor == CAMERA_SENSOR_OV5640) ? "; display rotate 90 CCW" : "");
   return true;
 }
 
@@ -1652,6 +1658,42 @@ static void bleStopLivePreview(bool notifyClient) {
     bleSendStatus("LIVE OFF");
   }
   Serial.println("BLE LIVE OFF: camera released; SD browser remains connected");
+}
+
+// Copy a range from the logical OV5640 Live JPEG with the same EXIF
+// Orientation 8 tag used by saved photos. This keeps the existing JPEG pixels
+// and BLE packet framing intact, so there is effectively no Live FPS penalty.
+// Logical byte stream:
+//   original SOI (2 bytes) + EXIF APP1 + remainder of original JPEG.
+static void copyOv5640OrientedLiveJpegRange(const camera_fb_t* frame,
+                                           size_t logicalOffset,
+                                           uint8_t* dst,
+                                           size_t len) {
+  if (!frame || !dst || len == 0) return;
+
+  const size_t exifLen = sizeof(OV5640_EXIF_ORIENTATION_90_CCW);
+  const size_t soiEnd = 2;
+  const size_t exifEnd = soiEnd + exifLen;
+
+  size_t out = 0;
+  while (out < len) {
+    const size_t pos = logicalOffset + out;
+    if (pos < soiEnd) {
+      const size_t chunk = min(len - out, soiEnd - pos);
+      memcpy(dst + out, frame->buf + pos, chunk);
+      out += chunk;
+    } else if (pos < exifEnd) {
+      const size_t exifPos = pos - soiEnd;
+      const size_t chunk = min(len - out, exifLen - exifPos);
+      memcpy(dst + out, OV5640_EXIF_ORIENTATION_90_CCW + exifPos, chunk);
+      out += chunk;
+    } else {
+      const size_t srcPos = pos - exifLen;
+      const size_t chunk = min(len - out, frame->len - srcPos);
+      memcpy(dst + out, frame->buf + srcPos, chunk);
+      out += chunk;
+    }
+  }
 }
 
 static void bleUpdateLivePreview() {
@@ -1676,23 +1718,31 @@ static void bleUpdateLivePreview() {
     return;
   }
 
+  const bool orientLive90Ccw =
+      detectedCameraSensor == CAMERA_SENSOR_OV5640 &&
+      frame->buf[0] == 0xFF && frame->buf[1] == 0xD8;
+  const size_t liveJpegLen =
+      frame->len + (orientLive90Ccw ? sizeof(OV5640_EXIF_ORIENTATION_90_CCW) : 0U);
+  const uint16_t liveDisplayWidth = orientLive90Ccw ? frame->height : frame->width;
+  const uint16_t liveDisplayHeight = orientLive90Ccw ? frame->width : frame->height;
+
   uint16_t frameId = ++bleLiveFrameId;
   if (frameId == 0) frameId = ++bleLiveFrameId; // reserve zero as invalid in the test viewer
-  bleSendStatus("BEGIN LIVE " + String(frameId) + " " + String((uint32_t)frame->len) +
-                " " + String(frame->width) + " " + String(frame->height) +
+  bleSendStatus("BEGIN LIVE " + String(frameId) + " " + String((uint32_t)liveJpegLen) +
+                " " + String(liveDisplayWidth) + " " + String(liveDisplayHeight) +
                 " " + String(bleLiveJpegQuality));
 
   uint8_t packet[244];
   uint32_t offset = 0;
   bool cancelled = false;
-  while (offset < frame->len && bleClientConnected && bleModeActive &&
+  while ((size_t)offset < liveJpegLen && bleClientConnected && bleModeActive &&
          bleLiveModeActive && !usbHostConnected) {
     updateBluetoothBlueLed();
     size_t mtuPayload = blePayloadBytes();
     if (mtuPayload > sizeof(packet)) mtuPayload = sizeof(packet);
     if (mtuPayload <= BLE_LIVE_DATA_HEADER_BYTES) mtuPayload = 20;
     const size_t payloadCapacity = mtuPayload - BLE_LIVE_DATA_HEADER_BYTES;
-    const size_t frameBytesRemaining = (size_t)frame->len - (size_t)offset;
+    const size_t frameBytesRemaining = liveJpegLen - (size_t)offset;
     const size_t wanted = (payloadCapacity < frameBytesRemaining)
                               ? payloadCapacity
                               : frameBytesRemaining;
@@ -1708,7 +1758,12 @@ static void bleUpdateLivePreview() {
     packet[3] = (uint8_t)(offset >> 8);
     packet[4] = (uint8_t)(offset >> 16);
     packet[5] = (uint8_t)(offset >> 24);
-    memcpy(packet + BLE_LIVE_DATA_HEADER_BYTES, frame->buf + offset, wanted);
+    if (orientLive90Ccw) {
+      copyOv5640OrientedLiveJpegRange(frame, offset,
+                                     packet + BLE_LIVE_DATA_HEADER_BYTES, wanted);
+    } else {
+      memcpy(packet + BLE_LIVE_DATA_HEADER_BYTES, frame->buf + offset, wanted);
+    }
     bleDataCharacteristic->setValue(packet, wanted + BLE_LIVE_DATA_HEADER_BYTES);
     bleDataCharacteristic->notify();
     offset += (uint32_t)wanted;
