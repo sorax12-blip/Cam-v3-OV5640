@@ -2,7 +2,7 @@ name: Build Android APK
 on:
   workflow_dispatch:
   push:
-    branches: [ main, esp32-cam-hd-s26-fix ]
+    branches: [ main, esp32-cam-hd-s26-fix, ov3660-apk-v2.6.2 ]
 
 jobs:
   build:
@@ -25,6 +25,15 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
+      - name: Assemble accepted viewer into APK asset
+        shell: bash
+        run: |
+          cat app/viewer_chunks/*.htmlpart > app/src/main/assets/index.html
+          test "$(wc -c < app/src/main/assets/index.html)" -gt 4900000
+          grep -Fq "UI Refresh Final v1 • APK Native BLE" app/src/main/assets/index.html
+          grep -Fq ".toast{position:absolute" app/src/main/assets/index.html
+          grep -Fq "bottom:4px" app/src/main/assets/index.html
+          grep -Fq "await send('LIVE INFO');await send('INDEX')" app/src/main/assets/index.html
       - name: Build debug APK
         run: gradle :app:assembleDebug
       - uses: actions/upload-artifact@v4
