@@ -359,6 +359,8 @@ static bool runMotionComparison(float& averageChangedPercent, float& peakChanged
 static void batteryEnterActivePower();
 static void batteryEnterIdlePower();
 static void batteryCameraIdleMode();
+static void mountSD();
+static void initializeMediaSequences();
 static bool findUsbSdPhysicalDrive();
 static void usbMassStorageBegin();
 static void enterUsbMassStorageMode();
