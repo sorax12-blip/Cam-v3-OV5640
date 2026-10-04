@@ -203,14 +203,11 @@ static const uint8_t OV5640_EXIF_ORIENTATION_90_CCW[] = {
   0x00, 0x00, 0x00, 0x00                    // no next IFD
 };
 
-static constexpr uint8_t CAMERA_FB_COUNT = 3;
-
-// OV5640 QSXGA/Q4 can exceed the esp32-camera default JPEG buffer
-// (2560*1920/5 = 983,040 bytes). Event mode therefore uses two much larger
-// PSRAM buffers, while ordinary monitoring/Live keeps the normal profile.
-static constexpr uint8_t OV5640_EVENT_FB_COUNT = 2;
-static constexpr size_t OV5640_EVENT_JPEG_BUFFER_BYTES = 2621440; // 2.5 MiB
-static constexpr size_t OV5640_MIN_QSXGA_JPEG_BYTES = 32768;      // reject obvious corrupt/truncated frames
+// esp32-camera 2.1.7 allocates JPEG buffers from Kconfig rather than a
+// per-camera_config_t size. Use two buffers so the global 2.5 MiB JPEG slots
+// fit comfortably in 8 MiB PSRAM. This is also appropriate for still capture.
+static constexpr uint8_t CAMERA_FB_COUNT = 2;
+static constexpr size_t OV5640_MIN_QSXGA_JPEG_BYTES = 32768; // reject obvious corrupt/truncated frames
 
 static const char* PHOTO_ROOT = "/Photos";
 
@@ -219,7 +216,6 @@ static bool sdReady = false;
 static bool qsxgaInitSucceeded = true;
 static bool qxgaInitSucceeded = true;
 static bool cameraWasInitializedOnce = false;
-static bool ov5640EventInitRequested = false;
 static uint8_t activeCameraFbCount = CAMERA_FB_COUNT;
 
 // Sensor is identified from sensor_t::id.PID immediately after camera init.
@@ -892,19 +888,11 @@ static void cameraBegin() {
   c.jpeg_quality = PHOTO_JPEG_QUALITY;
   c.fb_count = CAMERA_FB_COUNT;
   c.fb_location = CAMERA_FB_IN_PSRAM;
-  c.grab_mode = CAMERA_GRAB_LATEST;
-  c.jpeg_buffer_size = 0;
+  c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
-  const bool useOv5640EventBuffers =
-      ov5640EventInitRequested && detectedCameraSensor == CAMERA_SENSOR_OV5640;
-  if (useOv5640EventBuffers) {
-    c.fb_count = OV5640_EVENT_FB_COUNT;
-    c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-    c.jpeg_buffer_size = OV5640_EVENT_JPEG_BUFFER_BYTES;
-    Serial.printf("OV5640 EVENT camera init: %u x %.2f MiB JPEG buffers, GRAB_WHEN_EMPTY\n",
-                  (unsigned)c.fb_count,
-                  c.jpeg_buffer_size / (1024.0 * 1024.0));
-  }
+  Serial.printf("Camera init: %u PSRAM frame buffers, GRAB_WHEN_EMPTY, JPEG buffer %.2f MiB (Kconfig)\n",
+                (unsigned)c.fb_count,
+                CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE / (1024.0 * 1024.0));
 
   esp_err_t err = esp_camera_init(&c);
   if (err != ESP_OK) {
@@ -1288,9 +1276,7 @@ static bool prepareEventSavedPhotoMode() {
       delay(20);
     }
 
-    ov5640EventInitRequested = true;
     cameraBegin();
-    ov5640EventInitRequested = false;
 
     if (!cameraReady) {
       Serial.println("OV5640 EVENT prep failed: camera reinitialization failed");
@@ -1298,7 +1284,7 @@ static bool prepareEventSavedPhotoMode() {
     }
     Serial.printf("OV5640 EVENT prep ready: QSXGA Q4, %u frame buffers, %.2f MiB JPEG buffer each\n",
                   (unsigned)activeCameraFbCount,
-                  OV5640_EVENT_JPEG_BUFFER_BYTES / (1024.0 * 1024.0));
+                  CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE / (1024.0 * 1024.0));
     return true;
   }
 
