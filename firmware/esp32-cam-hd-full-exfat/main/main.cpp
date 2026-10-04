@@ -182,6 +182,9 @@ static constexpr uint32_t MAX_PHOTO_NUMBER = MAX_MEDIA_FOLDERS * PHOTOS_PER_FOLD
 // OV3660 stays on its proven QXGA profile. OV5640 uses the maximum
 // esp32-camera supported still size for this sensor: QSXGA (2560x1920).
 static constexpr uint8_t PHOTO_JPEG_QUALITY = 4;
+static constexpr uint8_t OV5640_QSXGA_EVENT_JPEG_QUALITY = 6;
+static constexpr uint8_t OV5640_QXGA_FALLBACK_JPEG_QUALITY = 4;
+static constexpr uint32_t OV5640_EVENT_SETTLE_MS = 350;
 static constexpr framesize_t OV3660_SAVED_FRAME_SIZE = FRAMESIZE_QXGA;
 static constexpr framesize_t OV5640_SAVED_FRAME_SIZE = FRAMESIZE_QSXGA;
 // EXIF orientation 8 = display 90 degrees counter-clockwise.
@@ -217,6 +220,8 @@ static bool qsxgaInitSucceeded = true;
 static bool qxgaInitSucceeded = true;
 static bool cameraWasInitializedOnce = false;
 static uint8_t activeCameraFbCount = CAMERA_FB_COUNT;
+static bool ov5640EventProfileRequested = false;
+static bool ov5640EventUseQxgaFallback = false;
 
 // Sensor is identified from sensor_t::id.PID immediately after camera init.
 // This lets one firmware image run with either supported camera module.
@@ -321,6 +326,27 @@ static uint32_t nextMotionCheckDueMs = 0;
 static uint32_t nextEventPhotoDueMs = 0;
 static uint32_t eventBlockStartedMs = 0;
 static uint32_t eventPhotosThisBlock = 0;
+
+static bool ov5640EventProfileActive() {
+  return detectedCameraSensor == CAMERA_SENSOR_OV5640 &&
+         (captureMode == CAPTURE_MODE_EVENT || ov5640EventProfileRequested);
+}
+
+static framesize_t desiredSavedPhotoFrameSize(uint16_t pid) {
+  if (pid == OV5640_PID && ov5640EventProfileActive() && ov5640EventUseQxgaFallback) {
+    return FRAMESIZE_QXGA;
+  }
+  return preferredSavedPhotoFrameSize(pid);
+}
+
+static uint8_t desiredSavedPhotoJpegQuality(uint16_t pid) {
+  if (pid == OV5640_PID && ov5640EventProfileActive()) {
+    return ov5640EventUseQxgaFallback
+        ? OV5640_QXGA_FALLBACK_JPEG_QUALITY
+        : OV5640_QSXGA_EVENT_JPEG_QUALITY;
+  }
+  return PHOTO_JPEG_QUALITY;
+}
 
 // Comparison scratch storage. Five signatures use only 6000 bytes.
 static uint8_t motionSignatures[MOTION_COMPARE_FRAMES][MOTION_SIG_CELLS];
@@ -890,14 +916,26 @@ static void cameraBegin() {
   c.fb_location = CAMERA_FB_IN_PSRAM;
   c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
-  Serial.printf("Camera init: %u PSRAM frame buffers, GRAB_WHEN_EMPTY, JPEG buffer %.2f MiB (Kconfig)\n",
+  if (ov5640EventProfileRequested && detectedCameraSensor == CAMERA_SENSOR_OV5640) {
+    c.frame_size = ov5640EventUseQxgaFallback ? FRAMESIZE_QXGA : FRAMESIZE_QSXGA;
+    c.jpeg_quality = ov5640EventUseQxgaFallback
+        ? OV5640_QXGA_FALLBACK_JPEG_QUALITY
+        : OV5640_QSXGA_EVENT_JPEG_QUALITY;
+  }
+
+  Serial.printf("Camera init: %u PSRAM frame buffers, GRAB_WHEN_EMPTY, JPEG buffer %.2f MiB (Kconfig), frame=%d Q%u\n",
                 (unsigned)c.fb_count,
-                CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE / (1024.0 * 1024.0));
+                CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE / (1024.0 * 1024.0),
+                (int)c.frame_size, (unsigned)c.jpeg_quality);
 
   esp_err_t err = esp_camera_init(&c);
   if (err != ESP_OK) {
     Serial.printf("Camera QSXGA init failed: 0x%x; retry QXGA\n", err);
     qsxgaInitSucceeded = false;
+    if (ov5640EventProfileRequested && detectedCameraSensor == CAMERA_SENSOR_OV5640) {
+      ov5640EventUseQxgaFallback = true;
+      c.jpeg_quality = OV5640_QXGA_FALLBACK_JPEG_QUALITY;
+    }
     c.frame_size = FRAMESIZE_QXGA;
     err = esp_camera_init(&c);
   }
@@ -938,8 +976,8 @@ static void cameraBegin() {
                   detectedCameraPid);
   }
 
-  // Both sensors use JPEG Q4; saved resolution is selected per sensor.
-  s->set_quality(s, PHOTO_JPEG_QUALITY);
+  // Preserve the quality selected for this camera profile.
+  s->set_quality(s, c.jpeg_quality);
 
   activeCameraFbCount = c.fb_count;
   cameraReady = true;
@@ -948,7 +986,7 @@ static void cameraBegin() {
                   cameraModelName(detectedCameraSensor), detectedCameraPid,
                   s->status.framesize);
     if (detectedCameraSensor == CAMERA_SENSOR_OV5640) {
-      Serial.println("OV5640 detected: saved-photo target QSXGA 2560x1920, JPEG Q4");
+      Serial.println("OV5640 detected: event target QSXGA 2560x1920 JPEG Q6; latched fallback QXGA 2048x1536 JPEG Q4");
     }
     Serial.printf("Camera initialized with %u PSRAM frame buffers\n", (unsigned)activeCameraFbCount);
     cameraWasInitializedOnce = true;
@@ -970,21 +1008,27 @@ static bool configureSavedPhotoMode(bool flushAfterChange) {
   sensor_t* sensor = esp_camera_sensor_get();
   if (!sensor) return false;
 
-  framesize_t wanted = preferredSavedPhotoFrameSize(sensor->id.PID);
-  if (sensor->id.PID == OV5640_PID && !qsxgaInitSucceeded) {
+  framesize_t wanted = desiredSavedPhotoFrameSize(sensor->id.PID);
+  uint8_t wantedQuality = desiredSavedPhotoJpegQuality(sensor->id.PID);
+
+  if (sensor->id.PID == OV5640_PID && !qsxgaInitSucceeded && wanted == FRAMESIZE_QSXGA) {
+    ov5640EventUseQxgaFallback = true;
     wanted = qxgaInitSucceeded ? FRAMESIZE_QXGA : FRAMESIZE_UXGA;
+    wantedQuality = OV5640_QXGA_FALLBACK_JPEG_QUALITY;
   } else if (sensor->id.PID != OV5640_PID && !qxgaInitSucceeded) {
     wanted = FRAMESIZE_UXGA;
   }
+
   bool changed = false;
   if (sensor->status.framesize != wanted) {
     if (sensor->set_framesize(sensor, wanted) != 0) return false;
     changed = true;
   }
-  if (sensor->status.quality != PHOTO_JPEG_QUALITY) {
-    sensor->set_quality(sensor, PHOTO_JPEG_QUALITY);
+  if (sensor->status.quality != wantedQuality) {
+    sensor->set_quality(sensor, wantedQuality);
     changed = true;
-  }  if (changed && flushAfterChange) flushCameraFrames(activeCameraFbCount);
+  }
+  if (changed && flushAfterChange) flushCameraFrames(activeCameraFbCount);
   return true;
 }
 
@@ -1012,32 +1056,83 @@ static bool isValidSavedJpegFrame(const camera_fb_t* frame) {
   return true;
 }
 
+static bool activateOv5640QxgaEventFallback() {
+  if (detectedCameraSensor != CAMERA_SENSOR_OV5640) return false;
+  if (!ov5640EventUseQxgaFallback) {
+    Serial.println("OV5640 QSXGA Q6 capture failed: latching QXGA Q4 for the remainder of this event");
+  }
+  ov5640EventUseQxgaFallback = true;
+
+  if (cameraReady) {
+    esp_camera_deinit();
+    cameraReady = false;
+    delay(20);
+  }
+
+  ov5640EventProfileRequested = true;
+  cameraBegin();
+  ov5640EventProfileRequested = false;
+
+  if (!cameraReady) {
+    Serial.println("OV5640 QXGA fallback reinitialization failed");
+    return false;
+  }
+
+  delay(OV5640_EVENT_SETTLE_MS);
+  Serial.println("OV5640 event fallback active: QXGA 2048x1536 Q4; QSXGA will not retry until the next new motion event");
+  return true;
+}
+
 static camera_fb_t* getHighestResolutionFrame() {
   if (!cameraReady) return nullptr;
   sensor_t* sensor = esp_camera_sensor_get();
   if (!sensor) return nullptr;
 
-  // Fast path: keep the camera in the selected full-resolution mode during
-  // 750-ms event capture so we do not throw away three frames every cycle.
+  // OV5640 EVENT policy:
+  // - New event starts at QSXGA 2560x1920 Q6.
+  // - One bad/timeout/truncated QSXGA capture latches QXGA 2048x1536 Q4.
+  // - The latch remains for the rest of the event, including later 2.5-minute blocks.
+  if (sensor->id.PID == OV5640_PID && captureMode == CAPTURE_MODE_EVENT) {
+    if (!configureSavedPhotoMode(true)) {
+      if (!ov5640EventUseQxgaFallback && activateOv5640QxgaEventFallback()) {
+        sensor = esp_camera_sensor_get();
+      } else {
+        return nullptr;
+      }
+    }
+
+    camera_fb_t* frame = esp_camera_fb_get();
+    if (isValidSavedJpegFrame(frame)) return frame;
+    if (frame) esp_camera_fb_return(frame);
+
+    if (!ov5640EventUseQxgaFallback) {
+      if (!activateOv5640QxgaEventFallback()) return nullptr;
+      frame = esp_camera_fb_get();
+      if (isValidSavedJpegFrame(frame)) return frame;
+      if (frame) esp_camera_fb_return(frame);
+    }
+    return nullptr;
+  }
+
+  // OV3660 and non-event recovery behavior remains unchanged.
   if (configureSavedPhotoMode(true)) {
     camera_fb_t* frame = esp_camera_fb_get();
     if (isValidSavedJpegFrame(frame)) return frame;
     if (frame) esp_camera_fb_return(frame);
   }
 
-  // Recovery path: progressively lower the still resolution if the sensor or
-  // frame buffers fail at the preferred setting.
   const framesize_t frameSizes[] = {
     FRAMESIZE_QSXGA, FRAMESIZE_QXGA, FRAMESIZE_UXGA,
     FRAMESIZE_SXGA, FRAMESIZE_XGA, FRAMESIZE_SVGA, FRAMESIZE_VGA
   };
-  int start = 1; // OV3660 starts at QXGA.
+  int stageStart = 1; // OV3660 starts at QXGA.
   if (sensor->id.PID == OV5640_PID) {
-    start = qsxgaInitSucceeded ? 0 : (qxgaInitSucceeded ? 1 : 2);
+    stageStart = qsxgaInitSucceeded ? 0 : (qxgaInitSucceeded ? 1 : 2);
   } else if (!qxgaInitSucceeded) {
-    start = 2;
+    stageStart = 2;
   }
-  for (int stage = start; stage < 7; ++stage) {
+
+  for (int stage = stageStart; stage < 7; ++stage) {
     if (sensor->set_framesize(sensor, frameSizes[stage]) != 0) continue;
     sensor->set_quality(sensor, PHOTO_JPEG_QUALITY);
     flushCameraFrames(activeCameraFbCount);
@@ -1047,7 +1142,6 @@ static camera_fb_t* getHighestResolutionFrame() {
   }
   return nullptr;
 }
-
 // Save a camera JPEG. OV5640 files receive a minimal EXIF Orientation tag
 // (value 8 = 90 degrees counter-clockwise for display) immediately after the
 // JPEG SOI marker. Pixel data is left untouched, avoiding an expensive 5 MP
@@ -1276,15 +1370,24 @@ static bool prepareEventSavedPhotoMode() {
       delay(20);
     }
 
+    ov5640EventProfileRequested = true;
     cameraBegin();
+    ov5640EventProfileRequested = false;
 
     if (!cameraReady) {
       Serial.println("OV5640 EVENT prep failed: camera reinitialization failed");
       return false;
     }
-    Serial.printf("OV5640 EVENT prep ready: QSXGA Q4, %u frame buffers, %.2f MiB JPEG buffer each\n",
+
+    delay(OV5640_EVENT_SETTLE_MS);
+    Serial.printf("OV5640 EVENT prep ready: %s Q%u, %u frame buffers, %.2f MiB JPEG buffer each; settled %lu ms\n",
+                  ov5640EventUseQxgaFallback ? "QXGA 2048x1536" : "QSXGA 2560x1920",
+                  (unsigned)(ov5640EventUseQxgaFallback
+                      ? OV5640_QXGA_FALLBACK_JPEG_QUALITY
+                      : OV5640_QSXGA_EVENT_JPEG_QUALITY),
                   (unsigned)activeCameraFbCount,
-                  CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE / (1024.0 * 1024.0));
+                  CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE / (1024.0 * 1024.0),
+                  (unsigned long)OV5640_EVENT_SETTLE_MS);
     return true;
   }
 
@@ -2297,6 +2400,11 @@ void loop() {
       const bool valid = cameraReady && runMotionComparison(averagePct, peakPct);
 
       if (valid && averagePct >= MOTION_TRIGGER_PERCENT) {
+        if (detectedCameraSensor == CAMERA_SENSOR_OV5640) {
+          ov5640EventUseQxgaFallback = false;
+          Serial.println("New OV5640 motion event: trying QSXGA 2560x1920 Q6");
+        }
+
         // Only now leave QQVGA monitoring mode. OV5640 is reinitialized
         // directly into QSXGA so we avoid the unstable QQVGA->QSXGA buffer flush.
         const bool eventCameraReady = prepareEventSavedPhotoMode();
@@ -2359,13 +2467,20 @@ void loop() {
         // now so the next event begins at the next folder's first number.
         advanceToFreshFolderIfNeeded("event stopped");
         captureMode = CAPTURE_MODE_MONITORING;
+        ov5640EventUseQxgaFallback = false;
         nextMotionCheckDueMs = millis() + MOTION_CHECK_INTERVAL_MS;
         batteryCameraIdleMode();
         batteryEnterIdlePower();
       }
     } else if ((int32_t)(now - nextEventPhotoDueMs) >= 0) {
       batteryEnterActivePower();
-      if (!cameraReady) cameraBegin();
+      if (!cameraReady) {
+        if (detectedCameraSensor == CAMERA_SENSOR_OV5640) {
+          prepareEventSavedPhotoMode();
+        } else {
+          cameraBegin();
+        }
+      }
 
       const uint32_t photoStartedMs = millis();
       if (cameraReady && capturePhoto()) {
