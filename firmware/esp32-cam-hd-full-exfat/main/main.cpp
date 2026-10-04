@@ -205,6 +205,13 @@ static const uint8_t OV5640_EXIF_ORIENTATION_90_CCW[] = {
 
 static constexpr uint8_t CAMERA_FB_COUNT = 3;
 
+// OV5640 QSXGA/Q4 can exceed the esp32-camera default JPEG buffer
+// (2560*1920/5 = 983,040 bytes). Event mode therefore uses two much larger
+// PSRAM buffers, while ordinary monitoring/Live keeps the normal profile.
+static constexpr uint8_t OV5640_EVENT_FB_COUNT = 2;
+static constexpr size_t OV5640_EVENT_JPEG_BUFFER_BYTES = 2621440; // 2.5 MiB
+static constexpr size_t OV5640_MIN_QSXGA_JPEG_BYTES = 32768;      // reject obvious corrupt/truncated frames
+
 static const char* PHOTO_ROOT = "/Photos";
 
 static bool cameraReady = false;
@@ -212,6 +219,8 @@ static bool sdReady = false;
 static bool qsxgaInitSucceeded = true;
 static bool qxgaInitSucceeded = true;
 static bool cameraWasInitializedOnce = false;
+static bool ov5640EventInitRequested = false;
+static uint8_t activeCameraFbCount = CAMERA_FB_COUNT;
 
 // Sensor is identified from sensor_t::id.PID immediately after camera init.
 // This lets one firmware image run with either supported camera module.
@@ -884,6 +893,18 @@ static void cameraBegin() {
   c.fb_count = CAMERA_FB_COUNT;
   c.fb_location = CAMERA_FB_IN_PSRAM;
   c.grab_mode = CAMERA_GRAB_LATEST;
+  c.jpeg_buffer_size = 0;
+
+  const bool useOv5640EventBuffers =
+      ov5640EventInitRequested && detectedCameraSensor == CAMERA_SENSOR_OV5640;
+  if (useOv5640EventBuffers) {
+    c.fb_count = OV5640_EVENT_FB_COUNT;
+    c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    c.jpeg_buffer_size = OV5640_EVENT_JPEG_BUFFER_BYTES;
+    Serial.printf("OV5640 EVENT camera init: %u x %.2f MiB JPEG buffers, GRAB_WHEN_EMPTY\n",
+                  (unsigned)c.fb_count,
+                  c.jpeg_buffer_size / (1024.0 * 1024.0));
+  }
 
   esp_err_t err = esp_camera_init(&c);
   if (err != ESP_OK) {
@@ -918,12 +939,12 @@ static void cameraBegin() {
     s->set_vflip(s, 1);
     s->set_hmirror(s, 0);
   } else if (detectedCameraSensor == CAMERA_SENSOR_OV5640) {
-    // OV5640 saved stills use the sensor's maximum esp32-camera profile:
-    // QSXGA 2560x1920 at JPEG Q4. Apply vertical flip at the sensor.
-    // A 90-degree counter-clockwise display orientation is added to saved
-    // JPEGs via EXIF so burst timing is not penalized by 5 MP re-encoding.
+    // OV5640 saved stills use QSXGA 2560x1920 at JPEG Q4.
+    // Keep the existing sensor vflip and add hmirror so, after the existing
+    // EXIF Orientation 8 (90 CCW), the displayed saved image gets the same
+    // corrected vertical/top-bottom orientation as the fixed BLE Live view.
     s->set_vflip(s, 1);
-    s->set_hmirror(s, 0);
+    s->set_hmirror(s, 1);
   } else {
     Serial.printf("WARNING: unsupported/unrecognized camera PID 0x%x; using generic fallback behavior\n",
                   detectedCameraPid);
@@ -932,6 +953,7 @@ static void cameraBegin() {
   // Both sensors use JPEG Q4; saved resolution is selected per sensor.
   s->set_quality(s, PHOTO_JPEG_QUALITY);
 
+  activeCameraFbCount = c.fb_count;
   cameraReady = true;
   if (!cameraWasInitializedOnce) {
     Serial.printf("Detected camera: %s (PID 0x%x), frame size enum %d\n",
@@ -940,7 +962,7 @@ static void cameraBegin() {
     if (detectedCameraSensor == CAMERA_SENSOR_OV5640) {
       Serial.println("OV5640 detected: saved-photo target QSXGA 2560x1920, JPEG Q4");
     }
-    Serial.printf("Camera initialized with %u PSRAM frame buffers\n", (unsigned)CAMERA_FB_COUNT);
+    Serial.printf("Camera initialized with %u PSRAM frame buffers\n", (unsigned)activeCameraFbCount);
     cameraWasInitializedOnce = true;
   }
 }
@@ -974,7 +996,31 @@ static bool configureSavedPhotoMode(bool flushAfterChange) {
   if (sensor->status.quality != PHOTO_JPEG_QUALITY) {
     sensor->set_quality(sensor, PHOTO_JPEG_QUALITY);
     changed = true;
-  }  if (changed && flushAfterChange) flushCameraFrames(CAMERA_FB_COUNT);
+  }  if (changed && flushAfterChange) flushCameraFrames(activeCameraFbCount);
+  return true;
+}
+
+static bool isValidSavedJpegFrame(const camera_fb_t* frame) {
+  if (!frame || !frame->buf || frame->format != PIXFORMAT_JPEG || frame->len < 4) return false;
+
+  if (frame->buf[0] != 0xFF || frame->buf[1] != 0xD8) {
+    Serial.printf("Rejecting camera frame: missing JPEG SOI (%ux%u, %u bytes)\n",
+                  frame->width, frame->height, (unsigned)frame->len);
+    return false;
+  }
+  if (frame->buf[frame->len - 2] != 0xFF || frame->buf[frame->len - 1] != 0xD9) {
+    Serial.printf("Rejecting camera frame: missing JPEG EOI (%ux%u, %u bytes)\n",
+                  frame->width, frame->height, (unsigned)frame->len);
+    return false;
+  }
+
+  if (detectedCameraSensor == CAMERA_SENSOR_OV5640 &&
+      frame->width == 2560 && frame->height == 1920 &&
+      frame->len < OV5640_MIN_QSXGA_JPEG_BYTES) {
+    Serial.printf("Rejecting suspiciously small OV5640 QSXGA JPEG: %u bytes\n",
+                  (unsigned)frame->len);
+    return false;
+  }
   return true;
 }
 
@@ -987,7 +1033,7 @@ static camera_fb_t* getHighestResolutionFrame() {
   // 750-ms event capture so we do not throw away three frames every cycle.
   if (configureSavedPhotoMode(true)) {
     camera_fb_t* frame = esp_camera_fb_get();
-    if (frame && frame->format == PIXFORMAT_JPEG && frame->len > 256) return frame;
+    if (isValidSavedJpegFrame(frame)) return frame;
     if (frame) esp_camera_fb_return(frame);
   }
 
@@ -1006,9 +1052,9 @@ static camera_fb_t* getHighestResolutionFrame() {
   for (int stage = start; stage < 7; ++stage) {
     if (sensor->set_framesize(sensor, frameSizes[stage]) != 0) continue;
     sensor->set_quality(sensor, PHOTO_JPEG_QUALITY);
-    flushCameraFrames(CAMERA_FB_COUNT);
+    flushCameraFrames(activeCameraFbCount);
     camera_fb_t* frame = esp_camera_fb_get();
-    if (frame && frame->format == PIXFORMAT_JPEG && frame->len > 256) return frame;
+    if (isValidSavedJpegFrame(frame)) return frame;
     if (frame) esp_camera_fb_return(frame);
   }
   return nullptr;
@@ -1027,10 +1073,9 @@ static bool writeSavedJpeg(File& output, const camera_fb_t* frame, size_t& saved
     return savedBytes == frame->len;
   }
 
-  if (frame->buf[0] != 0xFF || frame->buf[1] != 0xD8) {
-    Serial.println("OV5640 JPEG missing SOI marker; saving without EXIF rotation tag");
-    savedBytes = output.write(frame->buf, frame->len);
-    return savedBytes == frame->len;
+  if (!isValidSavedJpegFrame(frame)) {
+    Serial.println("OV5640 JPEG validation failed; file will not be saved");
+    return false;
   }
 
   // JPEG APP1 Exif segment, little-endian TIFF, one Orientation SHORT entry.
@@ -1092,7 +1137,7 @@ static bool capturePhoto() {
                 ok ? "SAVED" : "FAILED", fileName,
                 frame->width, frame->height, (unsigned)savedBytes,
                 (detectedCameraSensor == CAMERA_SENSOR_OV5640)
-                    ? ", EXIF rotate 90 CCW" : "");
+                    ? ", EXIF rotate 90 CCW + corrected vertical orientation" : "");
   esp_camera_fb_return(frame);
 
   if (!ok) {
@@ -1196,7 +1241,7 @@ static bool runMotionComparison(float& averageChangedPercent, float& peakChanged
   sensor->set_quality(sensor, MOTION_COMPARE_JPEG_QUALITY);
 
   // Drain old full-resolution/idle frames. None of these are saved.
-  flushCameraFrames(CAMERA_FB_COUNT);
+  flushCameraFrames(activeCameraFbCount);
 
   Serial.println("Motion compare: capturing 5 unsaved frames...");
   for (uint8_t n = 0; n < MOTION_COMPARE_FRAMES; ++n) {
@@ -1242,11 +1287,18 @@ static bool prepareEventSavedPhotoMode() {
       cameraReady = false;
       delay(20);
     }
+
+    ov5640EventInitRequested = true;
     cameraBegin();
+    ov5640EventInitRequested = false;
+
     if (!cameraReady) {
       Serial.println("OV5640 EVENT prep failed: camera reinitialization failed");
       return false;
     }
+    Serial.printf("OV5640 EVENT prep ready: QSXGA Q4, %u frame buffers, %.2f MiB JPEG buffer each\n",
+                  (unsigned)activeCameraFbCount,
+                  OV5640_EVENT_JPEG_BUFFER_BYTES / (1024.0 * 1024.0));
     return true;
   }
 
@@ -1718,7 +1770,7 @@ static bool configureBleLivePreviewMode(bool flushAfterChange) {
     sensor->set_quality(sensor, bleLiveJpegQuality);
     changed = true;
   }
-  if (changed && flushAfterChange) flushCameraFrames(CAMERA_FB_COUNT);
+  if (changed && flushAfterChange) flushCameraFrames(activeCameraFbCount);
   return true;
 }
 
