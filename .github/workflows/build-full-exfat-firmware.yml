@@ -64,7 +64,9 @@ jobs:
           NORMAL USB STORAGE:
             Use the board connector labeled USB-OTG.
             Direct USB-C male to USB-C male is supported.
-            USB mass storage is READ-ONLY in this full camera firmware.
+            USB mass storage is WRITABLE with exclusive SD ownership.
+            Camera/BLE pause and the ESP32 filesystem unmounts before host access.
+            Host delete/write is enabled. SD remounts and numbering rescans after eject/disconnect.
 
           SD:
             exFAT supported
@@ -78,7 +80,14 @@ jobs:
 
           CAMERA:
             OV3660 and OV5640 PID auto-detect
-            Saved photos: QXGA 2048x1536 / JPEG Q4 current shared profile
+            OV3660 saved photos: QXGA 2048x1536 / JPEG Q4
+            OV5640 saved photos: QSXGA 2560x1920 / JPEG Q4
+
+          EVENT CAPTURE:
+            Saved photo interval: 750 ms
+            Event block: 150 seconds (2.5 minutes)
+            Nominal photos per full block: 200
+            Folder capacity: 2000 photos / 10 full blocks
           EOF
 
       - name: Upload firmware artifact
