@@ -12,10 +12,10 @@ struct BleIndexStats;  // Forward declaration for Arduino .ino auto-generated pr
  *   - If the average changed-area score is >= 10%, enter EVENT CAPTURE mode.
  *
  *   EVENT CAPTURE MODE
- *   - Save one full-quality photo every 600 ms.
- *   - After 2 minutes of event photos, stop briefly and capture another 5-frame
+ *   - Save one full-quality photo every 750 ms.
+ *   - After 2.5 minutes of event photos, stop briefly and capture another 5-frame
  *     comparison burst (also not saved).
- *   - If the comparison score is still >= 10%, continue for another 2-minute
+ *   - If the comparison score is still >= 10%, continue for another 2.5-minute
  *     event block. Otherwise return to MONITORING MODE.
  *
  * Motion comparison:
@@ -33,7 +33,7 @@ struct BleIndexStats;  // Forward declaration for Arduino .ino auto-generated pr
  *   - OV5640 uses its maximum esp32-camera supported still size,
  *     2560x1920 (QSXGA), JPEG quality 4.
  *   - Existing /Photos/00001... folder and F#_Pic_#.JPG naming is retained.
- *   - Each numbered folder holds up to 2,000 photos (10 full 2-minute event blocks).
+ *   - Each numbered folder holds up to 2,000 photos (10 full 2.5-minute event blocks).
  *   - Video recording has been removed completely.
  *
  * Bluetooth LE SD browser:
@@ -56,7 +56,7 @@ struct BleIndexStats;  // Forward declaration for Arduino .ino auto-generated pr
  *   - Green LED GPIO14 blinks 3 times/sec for 5 seconds at power-up.
  *   - No camera capture starts until the 5-second sequence is complete.
  *
- * USB-C read-only exFAT SD mass storage is retained. USB has priority over BLE.
+ * USB-C writable exFAT SD mass storage uses exclusive SD ownership. USB has priority over BLE.
  *   - Android/phone-first MSC: the SD LUN is reported present before USB
  *     enumeration so Samsung/Android can mount it immediately over direct USB-C or USB-OTG.
  */
@@ -81,6 +81,7 @@ struct BleIndexStats;  // Forward declaration for Arduino .ino auto-generated pr
 #include "driver/sdmmc_host.h"
 extern "C" {
 #include "diskio.h"
+#include "ff.h"
 }
 
 // ESP32-S3-N16R8 + OV3660 / OV5640 Camera Pin Configuration
@@ -137,10 +138,10 @@ static constexpr uint32_t MOTION_CHECK_INTERVAL_MS = 7500;
 static constexpr uint8_t MOTION_COMPARE_FRAMES = 5;
 static constexpr float MOTION_TRIGGER_PERCENT = 10.0f;
 static constexpr uint8_t MOTION_CELL_BRIGHTNESS_DELTA = 18;
-static constexpr uint32_t EVENT_PHOTO_INTERVAL_MS = 600;
-static constexpr uint32_t EVENT_RECHECK_INTERVAL_MS = 120000;
-// One uninterrupted 2-minute block nominally saves 200 photos:
-// t=0, 0.60 s, ... 119.40 s, then the 120 s comparison takes priority.
+static constexpr uint32_t EVENT_PHOTO_INTERVAL_MS = 750;
+static constexpr uint32_t EVENT_RECHECK_INTERVAL_MS = 150000;
+// One uninterrupted 2.5-minute block nominally saves 200 photos:
+// t=0, 0.75 s, ... 149.25 s, then the 150 s comparison takes priority.
 static constexpr uint32_t PHOTOS_PER_EVENT_BLOCK =
     EVENT_RECHECK_INTERVAL_MS / EVENT_PHOTO_INTERVAL_MS;
 
@@ -164,14 +165,14 @@ static constexpr uint32_t BATTERY_ACTIVE_CPU_MHZ = 240;
 static constexpr bool BATTERY_CAMERA_LOW_RATE_BETWEEN_PHOTOS = true;
 static constexpr uint32_t BATTERY_IDLE_SLICE_MS = 100;
 // -------------------------------------------------------------------------
-// 2,000 photos per folder = 10 complete 2-minute event blocks at
-// one saved photo every 600 ms (200 photos per 2-minute block).
+// 2,000 photos per folder = 10 complete 2.5-minute event blocks at
+// one saved photo every 750 ms (200 photos per 2.5-minute block).
 // If a new/restarted block would begin with fewer than 200 slots left in the
 // current folder, those remaining numbers are intentionally skipped and the
 // next block starts at the first number of the next folder. Exactly 200 free
-// slots is allowed so a complete nominal 2-minute block can still fit.
+// slots is allowed so a complete nominal 2.5-minute block can still fit.
 static constexpr uint32_t PHOTOS_PER_FOLDER = 2000;
-static_assert(PHOTOS_PER_EVENT_BLOCK == 200, "2-minute block math changed");
+static_assert(PHOTOS_PER_EVENT_BLOCK == 200, "2.5-minute block math changed");
 static_assert((PHOTOS_PER_FOLDER % PHOTOS_PER_EVENT_BLOCK) == 0,
               "Folder size must contain whole event blocks");
 static constexpr uint32_t MAX_MEDIA_FOLDERS = 99999;
@@ -242,18 +243,19 @@ static framesize_t preferredSavedPhotoFrameSize(uint16_t pid) {
   return OV3660_SAVED_FRAME_SIZE;
 }
 
-// Native USB Mass Storage state. MSC is intentionally read-only.
-// Android/phone-first behavior: the SD medium is advertised as PRESENT from
-// the moment USB MSC starts so Android can mount it during initial enumeration.
-// Capture/BLE still pause as soon as the native USB host is mounted.
+// Native USB Mass Storage state. USB gets exclusive raw-SD ownership while active.
 static USBMSC usbMsc;
 static volatile bool usbHostConnected = false;
+static volatile bool usbEjectRequested = false;
 static bool usbMassStorageActive = false;
+static bool usbOwnsSdRaw = false;
+static FATFS* usbSavedFatFs = nullptr;
+
+// Raw SD layer used by USB MSC. Advertise physical card capacity rather than
+// filesystem-derived capacity.
 static uint8_t usbSdPdrv = 0xFF;
 static uint32_t usbPhysicalSectors = 0;
 static uint16_t usbPhysicalSectorSize = 512;
-static volatile uint32_t usbMscReadOps = 0;
-static volatile uint32_t usbMscReadFail = 0;
 
 // BLE is initialized only for a momentary-button-requested session.
 static const char* BLE_DEVICE_NAME = "ESP32 Cam HD";
@@ -370,6 +372,9 @@ static bool runMotionComparison(float& averageChangedPercent, float& peakChanged
 static void batteryEnterActivePower();
 static void batteryEnterIdlePower();
 static void batteryCameraIdleMode();
+static void mountSD();
+static void initializeMediaSequences();
+static bool findUsbSdPhysicalDrive();
 static void usbMassStorageBegin();
 static void enterUsbMassStorageMode();
 static void exitUsbMassStorageMode();
@@ -398,9 +403,11 @@ static size_t blePayloadBytes();
 static bool advanceToFreshFolderIfNeeded(const char* reason);
 
 // -------------------------------------------------------------------------
-// USB Mass Storage (read-only, exFAT-safe, physical-capacity-backed)
+// USB Mass Storage (writable, exclusive-SD ownership, exFAT-compatible)
 // -------------------------------------------------------------------------
 static bool findUsbSdPhysicalDrive() {
+  if (!sdReady) return false;
+
   const uint32_t wantedSectors =
       (uint32_t)(SD_MMC.cardSize() / (uint64_t)SD_MMC.sectorSize());
   const uint16_t wantedSectorSize = (uint16_t)SD_MMC.sectorSize();
@@ -410,6 +417,7 @@ static bool findUsbSdPhysicalDrive() {
     WORD sectorSize = 0;
     if (disk_ioctl(pdrv, GET_SECTOR_COUNT, &sectors) != RES_OK) continue;
     if (disk_ioctl(pdrv, GET_SECTOR_SIZE, &sectorSize) != RES_OK) continue;
+
     if ((uint64_t)sectors == (uint64_t)wantedSectors &&
         sectorSize == wantedSectorSize) {
       usbSdPdrv = pdrv;
@@ -422,53 +430,29 @@ static bool findUsbSdPhysicalDrive() {
 }
 
 static int32_t usbMscRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
-  ++usbMscReadOps;
-  if (!sdReady || usbSdPdrv == 0xFF || !buffer || bufsize == 0) {
-    ++usbMscReadFail;
-    return -1;
-  }
+  if (!usbMassStorageActive || !usbOwnsSdRaw || !buffer || bufsize == 0) return -1;
+  if (usbSdPdrv == 0xFF || usbPhysicalSectorSize == 0) return -1;
 
-  // A real block read proves that a USB host is present. This intentionally
-  // allows Android's very first probe instead of presenting an empty LUN.
-  usbHostConnected = true;
-
-  const uint32_t sectorSize = usbPhysicalSectorSize;
-  if (sectorSize == 0) {
-    ++usbMscReadFail;
-    return -1;
-  }
-
-  // Fast path: TinyUSB normally asks for one or more complete sectors.
-  if (offset == 0 && (bufsize % sectorSize) == 0) {
-    const uint32_t count = bufsize / sectorSize;
-    if ((uint64_t)lba + count > usbPhysicalSectors ||
-        disk_read(usbSdPdrv, static_cast<BYTE*>(buffer), lba, count) != RES_OK) {
-      ++usbMscReadFail;
-      return -1;
-    }
+  if (offset == 0 && (bufsize % usbPhysicalSectorSize) == 0) {
+    const uint32_t count = bufsize / usbPhysicalSectorSize;
+    if ((uint64_t)lba + count > usbPhysicalSectors) return -1;
+    if (disk_read(usbSdPdrv, static_cast<BYTE*>(buffer), lba, count) != RES_OK) return -1;
     return (int32_t)bufsize;
   }
 
-  // Safe fallback for an unaligned request.
   uint8_t sector[512];
-  if (sectorSize != sizeof(sector)) {
-    ++usbMscReadFail;
-    return -1;
-  }
-
-  uint64_t absolute = (uint64_t)lba * sectorSize + offset;
+  if (usbPhysicalSectorSize != sizeof(sector)) return -1;
+  uint64_t absolute = (uint64_t)lba * usbPhysicalSectorSize + offset;
   uint8_t* dst = static_cast<uint8_t*>(buffer);
   uint32_t remaining = bufsize;
-  while (remaining) {
-    const uint32_t sectorNumber = (uint32_t)(absolute / sectorSize);
-    const uint32_t inside = (uint32_t)(absolute % sectorSize);
-    if (sectorNumber >= usbPhysicalSectors ||
-        disk_read(usbSdPdrv, sector, sectorNumber, 1) != RES_OK) {
-      ++usbMscReadFail;
-      return -1;
-    }
 
-    uint32_t chunk = sectorSize - inside;
+  while (remaining) {
+    const uint32_t sectorNumber = (uint32_t)(absolute / usbPhysicalSectorSize);
+    const uint32_t inside = (uint32_t)(absolute % usbPhysicalSectorSize);
+    if (sectorNumber >= usbPhysicalSectors) return -1;
+    if (disk_read(usbSdPdrv, sector, sectorNumber, 1) != RES_OK) return -1;
+
+    uint32_t chunk = usbPhysicalSectorSize - inside;
     if (chunk > remaining) chunk = remaining;
     memcpy(dst, sector + inside, chunk);
     dst += chunk;
@@ -478,19 +462,58 @@ static int32_t usbMscRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t 
   return (int32_t)bufsize;
 }
 
-static int32_t usbMscWrite(uint32_t, uint32_t, uint8_t*, uint32_t) {
-  // Final camera firmware intentionally exposes the card read-only. This keeps
-  // Android/PC from modifying raw exFAT sectors while the camera VFS is mounted.
-  return -1;
+static int32_t usbMscWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
+  if (!usbMassStorageActive || !usbOwnsSdRaw || !buffer || bufsize == 0) return -1;
+  if (usbSdPdrv == 0xFF || usbPhysicalSectorSize == 0) return -1;
+
+  if (offset == 0 && (bufsize % usbPhysicalSectorSize) == 0) {
+    const uint32_t count = bufsize / usbPhysicalSectorSize;
+    if ((uint64_t)lba + count > usbPhysicalSectors) return -1;
+    if (disk_write(usbSdPdrv, static_cast<const BYTE*>(buffer), lba, count) != RES_OK) return -1;
+    disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr);
+    return (int32_t)bufsize;
+  }
+
+  uint8_t sector[512];
+  if (usbPhysicalSectorSize != sizeof(sector)) return -1;
+  uint64_t absolute = (uint64_t)lba * usbPhysicalSectorSize + offset;
+  const uint8_t* src = buffer;
+  uint32_t remaining = bufsize;
+
+  while (remaining) {
+    const uint32_t sectorNumber = (uint32_t)(absolute / usbPhysicalSectorSize);
+    const uint32_t inside = (uint32_t)(absolute % usbPhysicalSectorSize);
+    if (sectorNumber >= usbPhysicalSectors) return -1;
+    if (disk_read(usbSdPdrv, sector, sectorNumber, 1) != RES_OK) return -1;
+
+    uint32_t chunk = usbPhysicalSectorSize - inside;
+    if (chunk > remaining) chunk = remaining;
+    memcpy(sector + inside, src, chunk);
+    if (disk_write(usbSdPdrv, sector, sectorNumber, 1) != RES_OK) return -1;
+
+    src += chunk;
+    absolute += chunk;
+    remaining -= chunk;
+  }
+
+  disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr);
+  return (int32_t)bufsize;
 }
 
-static bool usbMscStartStop(uint8_t, bool, bool) {
+static bool usbMscStartStop(uint8_t, bool start, bool load_eject) {
+  if (!start && load_eject) {
+    if (usbSdPdrv != 0xFF) disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr);
+    usbEjectRequested = true;
+  } else if (start) {
+    usbEjectRequested = false;
+  }
   return true;
 }
 
 static void usbEventCallback(void*, esp_event_base_t event_base,
                              int32_t event_id, void*) {
   if (event_base != ARDUINO_USB_EVENTS) return;
+
   switch (event_id) {
     case ARDUINO_USB_STARTED_EVENT:
       usbHostConnected = true;
@@ -516,10 +539,10 @@ static void usbMassStorageBegin() {
     return;
   }
 
-  Serial.printf("USB MSC backing device: pdrv=%u, %lu sectors x %u bytes (%.2f GiB)\n",
+  Serial.printf("USB MSC raw SD: pdrv=%u, %lu sectors x %u bytes (%.2f GiB physical)\n",
                 usbSdPdrv,
                 (unsigned long)usbPhysicalSectors,
-                (unsigned)usbPhysicalSectorSize,
+                usbPhysicalSectorSize,
                 ((double)usbPhysicalSectors * usbPhysicalSectorSize) /
                     (1024.0 * 1024.0 * 1024.0));
 
@@ -531,12 +554,13 @@ static void usbMassStorageBegin() {
 
   usbMsc.vendorID("ESP32");
   usbMsc.productID("CAM_HD_EXFAT");
-  usbMsc.productRevision("3.0");
+  usbMsc.productRevision("3.1");
   usbMsc.onRead(usbMscRead);
   usbMsc.onWrite(usbMscWrite);
   usbMsc.onStartStop(usbMscStartStop);
-  usbMsc.isWritable(false);
-  usbMsc.mediaPresent(true);
+  usbMsc.isWritable(true);
+  // Keep the LUN absent until the ESP32 filesystem has been cleanly unmounted.
+  usbMsc.mediaPresent(false);
 
   if (!usbMsc.begin(usbPhysicalSectors, usbPhysicalSectorSize)) {
     Serial.println("USB MSC initialization failed");
@@ -549,7 +573,7 @@ static void usbMassStorageBegin() {
     return;
   }
 
-  Serial.println("USB-C mass storage ready: exFAT / full physical card / READ-ONLY / direct USB-C supported");
+  Serial.println("USB-C mass storage ready: WRITABLE exFAT / exclusive SD ownership / direct USB-C supported");
 }
 
 static void enterUsbMassStorageMode() {
@@ -561,15 +585,74 @@ static void enterUsbMassStorageMode() {
     cameraReady = false;
   }
 
+  char drive[3] = {(char)('0' + usbSdPdrv), ':', 0};
+  DWORD freeClusters = 0;
+  FATFS* currentFatFs = nullptr;
+
+  if (disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr) != RES_OK) {
+    Serial.println("USB MSC ownership handoff failed: SD sync failed");
+    return;
+  }
+  if (f_getfree(drive, &freeClusters, &currentFatFs) != FR_OK || !currentFatFs) {
+    Serial.println("USB MSC ownership handoff failed: could not obtain mounted FatFs");
+    return;
+  }
+  if (f_mount(nullptr, drive, 0) != FR_OK) {
+    Serial.println("USB MSC ownership handoff failed: could not unmount ESP32 filesystem");
+    return;
+  }
+
+  usbSavedFatFs = currentFatFs;
+  sdReady = false;
+  usbOwnsSdRaw = true;
   usbMassStorageActive = true;
-  Serial.printf("USB host connected: capture PAUSED; exFAT SD exposed READ-ONLY (reads=%lu failures=%lu)\n",
-                (unsigned long)usbMscReadOps, (unsigned long)usbMscReadFail);
+  usbMsc.mediaPresent(true);
+
+  Serial.println("USB host connected: capture/BLE PAUSED; ESP32 filesystem UNMOUNTED");
+  Serial.println("USB host now has exclusive WRITABLE SD ownership (delete/write enabled)");
 }
 
 static void exitUsbMassStorageMode() {
-  if (!usbMassStorageActive || usbHostConnected) return;
+  if (!usbMassStorageActive) return;
+  if (usbHostConnected && !usbEjectRequested) return;
 
+  usbMsc.mediaPresent(false);
+  if (usbSdPdrv != 0xFF) disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr);
+
+  usbOwnsSdRaw = false;
   usbMassStorageActive = false;
+
+  char drive[3] = {(char)('0' + usbSdPdrv), ':', 0};
+  bool remounted = false;
+  if (usbSavedFatFs && f_mount(usbSavedFatFs, drive, 1) == FR_OK) {
+    if (!SD_MMC.exists(PHOTO_ROOT)) SD_MMC.mkdir(PHOTO_ROOT);
+    sdReady = SD_MMC.exists(PHOTO_ROOT);
+    remounted = sdReady;
+  }
+
+  if (!remounted) {
+    Serial.println("USB handoff: direct FatFs remount failed; restarting SD stack");
+    SD_MMC.end();
+    sdReady = false;
+    usbSavedFatFs = nullptr;
+    mountSD();
+    remounted = sdReady;
+    if (remounted && !findUsbSdPhysicalDrive()) {
+      Serial.println("USB handoff recovery warning: SD remounted but raw drive lookup failed");
+    }
+  }
+
+  usbSavedFatFs = nullptr;
+  usbEjectRequested = false;
+
+  if (!remounted) {
+    Serial.println("USB host disconnected/ejected: SD REMOUNT FAILED; capture remains paused");
+    batteryEnterIdlePower();
+    return;
+  }
+
+  // Host may have deleted or added photos, so rebuild the numbering state.
+  initializeMediaSequences();
 
   const uint32_t now = millis();
   if (captureMode == CAPTURE_MODE_EVENT) {
@@ -577,10 +660,10 @@ static void exitUsbMassStorageMode() {
     eventBlockStartedMs = now;
     eventPhotosThisBlock = 0;
     nextEventPhotoDueMs = now + EVENT_PHOTO_INTERVAL_MS;
-    Serial.println("USB host disconnected: EVENT capture resumes in 600 ms; 2-minute block restarted");
+    Serial.println("USB host disconnected/ejected: SD remounted; EVENT resumes in 750 ms; 2.5-minute block restarted");
   } else {
     nextMotionCheckDueMs = now + MOTION_CHECK_INTERVAL_MS;
-    Serial.println("USB host disconnected: MONITORING resumes; next 5-frame check in 7.5 seconds");
+    Serial.println("USB host disconnected/ejected: SD remounted; MONITORING resumes in 7.5 seconds");
   }
   batteryEnterIdlePower();
 }
@@ -705,7 +788,7 @@ static uint32_t scanNextPhotoNumber() {
   return highest + 1;
 }
 
-// Keep each newly started/restarted 2-minute block inside one folder whenever
+// Keep each newly started/restarted 2.5-minute block inside one folder whenever
 // possible. If the current folder has fewer than 200 unused photo numbers
 // remaining, abandon those remaining numbers and begin at the next folder's
 // first number. Exactly 200 remaining slots is valid and is used for one full
@@ -720,7 +803,7 @@ static bool advanceToFreshFolderIfNeeded(const char* reason) {
   const uint32_t slotsRemaining = folderLast - nextPhotoNumber + 1;
 
   // A brand-new folder should never be skipped. Otherwise, reserve enough room
-  // for a complete nominal 2-minute / 200-photo block.
+  // for a complete nominal 2.5-minute / 200-photo block.
   if (nextPhotoNumber != folderFirst && slotsRemaining < PHOTOS_PER_EVENT_BLOCK) {
     if (folder >= MAX_MEDIA_FOLDERS) {
       Serial.println("Folder reserve rule reached maximum media folder; cannot advance");
@@ -933,7 +1016,7 @@ static camera_fb_t* getHighestResolutionFrame() {
 // Save a camera JPEG. OV5640 files receive a minimal EXIF Orientation tag
 // (value 8 = 90 degrees counter-clockwise for display) immediately after the
 // JPEG SOI marker. Pixel data is left untouched, avoiding an expensive 5 MP
-// decode/rotate/re-encode pass that would make the 600-ms burst target impossible.
+// decode/rotate/re-encode pass that would make the 750-ms burst target impossible.
 static bool writeSavedJpeg(File& output, const camera_fb_t* frame, size_t& savedBytes) {
   savedBytes = 0;
   if (!output || !frame || !frame->buf || frame->len < 2) return false;
@@ -1958,14 +2041,14 @@ static void stopBluetoothBrowser() {
   digitalWrite(BLUE_BLE_LED_PIN, LOW);
 
   // Resume whichever capture state was active before BLE. An EVENT block is
-  // restarted so the 2-minute timer counts only uninterrupted active capture.
+  // restarted so the 2.5-minute timer counts only uninterrupted active capture.
   const uint32_t now = millis();
   if (captureMode == CAPTURE_MODE_EVENT) {
     advanceToFreshFolderIfNeeded("BLE pause ended / block restart");
     eventBlockStartedMs = now;
     eventPhotosThisBlock = 0;
     nextEventPhotoDueMs = now + EVENT_PHOTO_INTERVAL_MS;
-    Serial.println("BLE mode OFF: EVENT capture resumes in 600 ms; 2-minute block restarted");
+    Serial.println("BLE mode OFF: EVENT capture resumes in 750 ms; 2.5-minute block restarted");
   } else {
     nextMotionCheckDueMs = now + MOTION_CHECK_INTERVAL_MS;
     Serial.println("BLE mode OFF: MONITORING resumes; next 5-frame check in 7.5 seconds");
@@ -2087,7 +2170,8 @@ void loop() {
 
   // USB-C mass storage has priority over BLE. A request that arrives during a
   // comparison burst or SD photo write is handled after that operation returns.
-  if (usbHostConnected) {
+  if (usbHostConnected && !usbEjectRequested) {
+    bleStartRequested = false;
     if (bleModeActive) stopBluetoothBrowser();
     enterUsbMassStorageMode();
     if (!batteryActivePower) batteryEnterActivePower();
@@ -2144,14 +2228,14 @@ void loop() {
       const bool valid = cameraReady && runMotionComparison(averagePct, peakPct);
 
       if (valid && averagePct >= MOTION_TRIGGER_PERCENT) {
-        // Never start a fresh 2-minute block when fewer than 200 slots remain
+        // Never start a fresh 2.5-minute block when fewer than 200 slots remain
         // in a partially used folder. This also handles a prior interrupted block.
         advanceToFreshFolderIfNeeded("new motion block");
         captureMode = CAPTURE_MODE_EVENT;
         eventBlockStartedMs = millis();
         eventPhotosThisBlock = 0;
         nextEventPhotoDueMs = millis();  // first saved event photo immediately
-        Serial.printf("MOTION TRIGGERED (avg %.1f%%): entering EVENT mode for at least 2 minutes\n",
+        Serial.printf("MOTION TRIGGERED (avg %.1f%%): entering EVENT mode for at least 2.5 minutes\n",
                       averagePct);
       } else {
         if (!valid) Serial.println("Motion comparison invalid; staying in MONITORING mode");
@@ -2165,7 +2249,7 @@ void loop() {
       }
     }
   } else {  // CAPTURE_MODE_EVENT
-    // At the 2-minute boundary, comparison takes priority over the next photo.
+    // At the 2.5-minute boundary, comparison takes priority over the next photo.
     if ((uint32_t)(now - eventBlockStartedMs) >= EVENT_RECHECK_INTERVAL_MS) {
       batteryEnterActivePower();
       if (!cameraReady) cameraBegin();
@@ -2176,17 +2260,17 @@ void loop() {
 
       if (!valid) {
         // Fail safe toward continuing capture. A transient JPEG/decode problem
-        // should not terminate an already-active event. This is a new 2-minute
+        // should not terminate an already-active event. This is a new 2.5-minute
         // block, so enforce the folder reserve boundary first.
         advanceToFreshFolderIfNeeded("event recheck failed / next block");
         eventBlockStartedMs = millis();
         eventPhotosThisBlock = 0;
         nextEventPhotoDueMs = millis();
-        Serial.println("EVENT recheck failed: continuing another 2-minute block as a safety fallback");
+        Serial.println("EVENT recheck failed: continuing another 2.5-minute block as a safety fallback");
       } else if (averagePct >= MOTION_TRIGGER_PERCENT) {
-        Serial.printf("EVENT recheck still active (avg %.1f%%; %lu photos in last block): continuing another 2 minutes\n",
+        Serial.printf("EVENT recheck still active (avg %.1f%%; %lu photos in last block): continuing another 2.5 minutes\n",
                       averagePct, (unsigned long)eventPhotosThisBlock);
-        advanceToFreshFolderIfNeeded("next 2-minute event block");
+        advanceToFreshFolderIfNeeded("next 2.5-minute event block");
         eventBlockStartedMs = millis();
         eventPhotosThisBlock = 0;
         nextEventPhotoDueMs = millis();
@@ -2211,13 +2295,13 @@ void loop() {
       }
 
       // Keep full-resolution camera mode during EVENT capture so the next shot
-      // does not pay the resolution-switch/flush penalty every 600 ms.
+      // does not pay the resolution-switch/flush penalty every 750 ms.
       batteryEnterIdlePower();
 
       nextEventPhotoDueMs += EVENT_PHOTO_INTERVAL_MS;
-      // If capture + SD write itself exceeds 600 ms, the requested cadence is
+      // If capture + SD write itself exceeds 750 ms, the requested cadence is
       // physically impossible. Start the next shot immediately rather than
-      // adding another 600-ms delay, so event capture runs as fast as hardware allows.
+      // adding another 750-ms delay, so event capture runs as fast as hardware allows.
       if ((int32_t)(millis() - nextEventPhotoDueMs) >= 0) {
         const uint32_t elapsed = millis() - photoStartedMs;
         Serial.printf("Event photo cadence overrun: operation took %u ms; target is %u ms; next shot ASAP\n",
