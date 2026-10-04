@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - esp32-cam-hd-s26-fix
+      - ov3660-writable-usb
     paths:
       - 'firmware/full-exfat/**'
       - '.github/workflows/build-full-exfat.yml'
