@@ -369,6 +369,7 @@ static V3BleCommandCallbacks v3BleCommandCallbacks;
 // Manual prototypes for the state-machine helpers.
 static bool capturePhoto();
 static bool runMotionComparison(float& averageChangedPercent, float& peakChangedPercent);
+static bool prepareEventSavedPhotoMode();
 static void batteryEnterActivePower();
 static void batteryEnterIdlePower();
 static void batteryCameraIdleMode();
@@ -1202,13 +1203,11 @@ static bool runMotionComparison(float& averageChangedPercent, float& peakChanged
     camera_fb_t* frame = esp_camera_fb_get();
     if (!frame) {
       Serial.printf("Motion compare failed: frame %u unavailable\n", (unsigned)(n + 1));
-      configureSavedPhotoMode(true);
       return false;
     }
     const bool ok = buildMotionSignature(frame, motionSignatures[n]);
     esp_camera_fb_return(frame);
     if (!ok) {
-      configureSavedPhotoMode(true);
       return false;
     }
   }
@@ -1226,12 +1225,34 @@ static bool runMotionComparison(float& averageChangedPercent, float& peakChanged
                 averageChangedPercent, peakChangedPercent, MOTION_TRIGGER_PERCENT,
                 averageChangedPercent >= MOTION_TRIGGER_PERCENT ? "MOTION" : "CLEAR");
 
-  // Return to full-resolution still mode now. Event mode can immediately save
-  // its first photo; monitoring mode will later drop to tiny idle frames.
-  if (!configureSavedPhotoMode(true)) {
-    Serial.println("Warning: unable to restore full-resolution photo mode after comparison");
-  }
+  // Deliberately remain in QQVGA after the comparison. Monitoring can stay
+  // low-resolution without bouncing the OV5640 back to QSXGA every 7.5 seconds.
+  // The caller explicitly prepares full-resolution mode only when EVENT capture
+  // is actually starting or continuing.
   return true;
+}
+
+static bool prepareEventSavedPhotoMode() {
+  // OV5640 is unreliable when dynamically switching straight from QQVGA back
+  // to QSXGA with queued frame buffers. Reinitialize it directly in its saved
+  // photo configuration only when an event really needs full-resolution shots.
+  if (detectedCameraSensor == CAMERA_SENSOR_OV5640) {
+    if (cameraReady) {
+      esp_camera_deinit();
+      cameraReady = false;
+      delay(20);
+    }
+    cameraBegin();
+    if (!cameraReady) {
+      Serial.println("OV5640 EVENT prep failed: camera reinitialization failed");
+      return false;
+    }
+    return true;
+  }
+
+  if (!cameraReady) cameraBegin();
+  if (!cameraReady) return false;
+  return configureSavedPhotoMode(true);
 }
 
 // -------------------------------------------------------------------------
@@ -1616,7 +1637,7 @@ static void bleSendLiveInfo() {
   info += " height=" + String(bleLiveHeight);
   info += " quality=" + String(bleLiveJpegQuality);
   info += " interval=" + String(bleLiveFrameIntervalMs);
-  if (detectedCameraSensor == CAMERA_SENSOR_OV5640) info += " rotation=CCW90";
+  if (detectedCameraSensor == CAMERA_SENSOR_OV5640) info += " rotation=CCW90 vflip=display";
   info += bleLiveModeActive ? " state=ON" : " state=OFF";
   bleSendStatus(info);
 }
@@ -1679,6 +1700,16 @@ static bool configureBleLivePreviewMode(bool flushAfterChange) {
   if (!sensor) return false;
 
   bool changed = false;
+
+  // OV5640 Live is presented with EXIF Orientation 8 (90 degrees CCW).
+  // Mirroring the sensor horizontally before that rotation produces the
+  // requested vertical/top-bottom flip in the final displayed Live image.
+  // Saved photos are untouched: Live releases/reinitializes the camera when it ends.
+  if (detectedCameraSensor == CAMERA_SENSOR_OV5640 && sensor->status.hmirror != 1) {
+    if (sensor->set_hmirror(sensor, 1) != 0) return false;
+    changed = true;
+  }
+
   if (sensor->status.framesize != bleLiveFrameSize) {
     if (sensor->set_framesize(sensor, bleLiveFrameSize) != 0) return false;
     changed = true;
@@ -1720,7 +1751,7 @@ static bool bleStartLivePreview() {
                 bleLiveProfileName(bleLiveFrameSize),
                 (unsigned)bleLiveWidth, (unsigned)bleLiveHeight,
                 (unsigned)bleLiveJpegQuality, (unsigned long)bleLiveFrameIntervalMs,
-                (detectedCameraSensor == CAMERA_SENSOR_OV5640) ? "; display rotate 90 CCW" : "");
+                (detectedCameraSensor == CAMERA_SENSOR_OV5640) ? "; display rotate 90 CCW + vertical flip" : "");
   return true;
 }
 
@@ -2228,6 +2259,13 @@ void loop() {
       const bool valid = cameraReady && runMotionComparison(averagePct, peakPct);
 
       if (valid && averagePct >= MOTION_TRIGGER_PERCENT) {
+        // Only now leave QQVGA monitoring mode. OV5640 is reinitialized
+        // directly into QSXGA so we avoid the unstable QQVGA->QSXGA buffer flush.
+        const bool eventCameraReady = prepareEventSavedPhotoMode();
+        if (!eventCameraReady) {
+          Serial.println("MOTION TRIGGERED but full-resolution EVENT camera prep failed; retrying on event capture");
+        }
+
         // Never start a fresh 2.5-minute block when fewer than 200 slots remain
         // in a partially used folder. This also handles a prior interrupted block.
         advanceToFreshFolderIfNeeded("new motion block");
@@ -2262,6 +2300,7 @@ void loop() {
         // Fail safe toward continuing capture. A transient JPEG/decode problem
         // should not terminate an already-active event. This is a new 2.5-minute
         // block, so enforce the folder reserve boundary first.
+        prepareEventSavedPhotoMode();
         advanceToFreshFolderIfNeeded("event recheck failed / next block");
         eventBlockStartedMs = millis();
         eventPhotosThisBlock = 0;
@@ -2270,6 +2309,7 @@ void loop() {
       } else if (averagePct >= MOTION_TRIGGER_PERCENT) {
         Serial.printf("EVENT recheck still active (avg %.1f%%; %lu photos in last block): continuing another 2.5 minutes\n",
                       averagePct, (unsigned long)eventPhotosThisBlock);
+        prepareEventSavedPhotoMode();
         advanceToFreshFolderIfNeeded("next 2.5-minute event block");
         eventBlockStartedMs = millis();
         eventPhotosThisBlock = 0;
