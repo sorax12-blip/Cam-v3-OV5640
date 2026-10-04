@@ -82,6 +82,7 @@ struct BleIndexStats;  // Forward declaration for Arduino .ino auto-generated pr
 #include "driver/sdmmc_host.h"
 extern "C" {
 #include "diskio.h"
+#include "ff.h"
 }
 
 // ESP32-S3-N16R8 + OV3660 / OV5640 Camera Pin Configuration
@@ -228,10 +229,13 @@ static bool cameraPidUsesCurrentQxgaProfile(uint16_t pid) {
   return pid == OV3660_PID || pid == OV5640_PID;
 }
 
-// Native USB Mass Storage state. MSC is intentionally read-only.
+// Native USB Mass Storage state. USB gets exclusive raw-SD ownership while active.
 static USBMSC usbMsc;
 static volatile bool usbHostConnected = false;
+static volatile bool usbEjectRequested = false;
 static bool usbMassStorageActive = false;
+static bool usbOwnsSdRaw = false;
+static FATFS* usbSavedFatFs = nullptr;
 
 // Raw SD layer used by USB MSC. We advertise physical card capacity rather
 // than SD_MMC.numSectors(), which can report filesystem-derived capacity.
@@ -384,7 +388,7 @@ static size_t blePayloadBytes();
 static bool advanceToFreshFolderIfNeeded(const char* reason);
 
 // -------------------------------------------------------------------------
-// USB Mass Storage (read-only, exFAT-compatible, full physical capacity)
+// USB Mass Storage (writable, exclusive-SD ownership, exFAT-compatible)
 // -------------------------------------------------------------------------
 static bool findUsbSdPhysicalDrive() {
   if (!sdReady) return false;
@@ -411,7 +415,7 @@ static bool findUsbSdPhysicalDrive() {
 }
 
 static int32_t usbMscRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
-  if (!usbMassStorageActive || !sdReady || !buffer || bufsize == 0) return -1;
+  if (!usbMassStorageActive || !usbOwnsSdRaw || !buffer || bufsize == 0) return -1;
   if (usbSdPdrv == 0xFF || usbPhysicalSectorSize == 0) return -1;
 
   if (offset == 0 && (bufsize % usbPhysicalSectorSize) == 0) {
@@ -423,18 +427,71 @@ static int32_t usbMscRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t 
 
   uint8_t sector[512];
   if (usbPhysicalSectorSize != sizeof(sector)) return -1;
-  if (lba >= usbPhysicalSectors) return -1;
-  if ((uint64_t)offset + bufsize > usbPhysicalSectorSize) return -1;
-  if (disk_read(usbSdPdrv, sector, lba, 1) != RES_OK) return -1;
-  memcpy(buffer, sector + offset, bufsize);
+  uint64_t absolute = (uint64_t)lba * usbPhysicalSectorSize + offset;
+  uint8_t* dst = static_cast<uint8_t*>(buffer);
+  uint32_t remaining = bufsize;
+
+  while (remaining) {
+    const uint32_t sectorNumber = (uint32_t)(absolute / usbPhysicalSectorSize);
+    const uint32_t inside = (uint32_t)(absolute % usbPhysicalSectorSize);
+    if (sectorNumber >= usbPhysicalSectors) return -1;
+    if (disk_read(usbSdPdrv, sector, sectorNumber, 1) != RES_OK) return -1;
+
+    uint32_t chunk = usbPhysicalSectorSize - inside;
+    if (chunk > remaining) chunk = remaining;
+    memcpy(dst, sector + inside, chunk);
+    dst += chunk;
+    absolute += chunk;
+    remaining -= chunk;
+  }
   return (int32_t)bufsize;
 }
 
-static int32_t usbMscWrite(uint32_t, uint32_t, uint8_t*, uint32_t) {
-  return -1;
+static int32_t usbMscWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
+  if (!usbMassStorageActive || !usbOwnsSdRaw || !buffer || bufsize == 0) return -1;
+  if (usbSdPdrv == 0xFF || usbPhysicalSectorSize == 0) return -1;
+
+  if (offset == 0 && (bufsize % usbPhysicalSectorSize) == 0) {
+    const uint32_t count = bufsize / usbPhysicalSectorSize;
+    if ((uint64_t)lba + count > usbPhysicalSectors) return -1;
+    if (disk_write(usbSdPdrv, static_cast<const BYTE*>(buffer), lba, count) != RES_OK) return -1;
+    disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr);
+    return (int32_t)bufsize;
+  }
+
+  uint8_t sector[512];
+  if (usbPhysicalSectorSize != sizeof(sector)) return -1;
+  uint64_t absolute = (uint64_t)lba * usbPhysicalSectorSize + offset;
+  const uint8_t* src = buffer;
+  uint32_t remaining = bufsize;
+
+  while (remaining) {
+    const uint32_t sectorNumber = (uint32_t)(absolute / usbPhysicalSectorSize);
+    const uint32_t inside = (uint32_t)(absolute % usbPhysicalSectorSize);
+    if (sectorNumber >= usbPhysicalSectors) return -1;
+    if (disk_read(usbSdPdrv, sector, sectorNumber, 1) != RES_OK) return -1;
+
+    uint32_t chunk = usbPhysicalSectorSize - inside;
+    if (chunk > remaining) chunk = remaining;
+    memcpy(sector + inside, src, chunk);
+    if (disk_write(usbSdPdrv, sector, sectorNumber, 1) != RES_OK) return -1;
+
+    src += chunk;
+    absolute += chunk;
+    remaining -= chunk;
+  }
+
+  disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr);
+  return (int32_t)bufsize;
 }
 
-static bool usbMscStartStop(uint8_t, bool, bool) {
+static bool usbMscStartStop(uint8_t, bool start, bool load_eject) {
+  if (!start && load_eject) {
+    disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr);
+    usbEjectRequested = true;
+  } else if (start) {
+    usbEjectRequested = false;
+  }
   return true;
 }
 
@@ -484,7 +541,7 @@ static void usbMassStorageBegin() {
   usbMsc.onRead(usbMscRead);
   usbMsc.onWrite(usbMscWrite);
   usbMsc.onStartStop(usbMscStartStop);
-  usbMsc.isWritable(false);
+  usbMsc.isWritable(true);
   usbMsc.mediaPresent(false);
 
   if (!usbMsc.begin(usbPhysicalSectors, usbPhysicalSectorSize)) {
@@ -498,44 +555,97 @@ static void usbMassStorageBegin() {
     return;
   }
 
-  Serial.println("USB-C mass storage ready (exFAT-capable, full physical capacity, READ-ONLY)");
+  Serial.println("USB-C mass storage ready (exFAT-capable, full physical capacity, WRITABLE with exclusive SD ownership)");
   Serial.println("Direct USB-C to USB-C uses the board connector labeled USB-OTG");
 }
 
 static void enterUsbMassStorageMode() {
   if (usbMassStorageActive || !usbHostConnected || !sdReady) return;
 
-  // No capture/file operation is in progress when this function is called.
-  // Stop the camera/XCLK so USB browsing cannot overlap camera SD writes.
   batteryEnterActivePower();
   if (cameraReady) {
     esp_camera_deinit();
     cameraReady = false;
   }
 
+  char drive[3] = {(char)('0' + usbSdPdrv), ':', 0};
+  DWORD freeClusters = 0;
+  FATFS* currentFatFs = nullptr;
+
+  if (disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr) != RES_OK) {
+    Serial.println("USB MSC ownership handoff failed: SD sync failed");
+    return;
+  }
+  if (f_getfree(drive, &freeClusters, &currentFatFs) != FR_OK || !currentFatFs) {
+    Serial.println("USB MSC ownership handoff failed: could not obtain mounted FatFs");
+    return;
+  }
+  if (f_mount(nullptr, drive, 0) != FR_OK) {
+    Serial.println("USB MSC ownership handoff failed: could not unmount ESP32 filesystem");
+    return;
+  }
+
+  usbSavedFatFs = currentFatFs;
+  sdReady = false;
+  usbOwnsSdRaw = true;
   usbMassStorageActive = true;
   usbMsc.mediaPresent(true);
-  Serial.println("USB host connected: capture PAUSED; SD exposed as READ-ONLY mass storage");
+
+  Serial.println("USB host connected: capture/BLE PAUSED; ESP32 filesystem UNMOUNTED");
+  Serial.println("USB host now has exclusive WRITABLE SD ownership");
 }
 
 static void exitUsbMassStorageMode() {
-  if (!usbMassStorageActive || usbHostConnected) return;
+  if (!usbMassStorageActive) return;
+  if (usbHostConnected && !usbEjectRequested) return;
 
   usbMsc.mediaPresent(false);
+  disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr);
+
+  usbOwnsSdRaw = false;
   usbMassStorageActive = false;
 
-  // Resume the current capture mode after USB access. Event mode restarts its
-  // two-minute active block because no event photos were taken while paused.
+  char drive[3] = {(char)('0' + usbSdPdrv), ':', 0};
+  bool remounted = false;
+  if (usbSavedFatFs && f_mount(usbSavedFatFs, drive, 1) == FR_OK) {
+    if (!SD_MMC.exists(PHOTO_ROOT)) SD_MMC.mkdir(PHOTO_ROOT);
+    sdReady = SD_MMC.exists(PHOTO_ROOT);
+    remounted = sdReady;
+  }
+
+  if (!remounted) {
+    Serial.println("USB handoff: direct FatFs remount failed; restarting SD stack");
+    SD_MMC.end();
+    sdReady = false;
+    usbSavedFatFs = nullptr;
+    mountSD();
+    remounted = sdReady;
+    if (remounted && !findUsbSdPhysicalDrive()) {
+      Serial.println("USB handoff recovery warning: SD remounted but raw drive lookup failed");
+    }
+  }
+
+  usbSavedFatFs = nullptr;
+  usbEjectRequested = false;
+
+  if (!remounted) {
+    Serial.println("USB host disconnected/ejected: SD REMOUNT FAILED; capture remains paused");
+    batteryEnterIdlePower();
+    return;
+  }
+
+  initializeMediaSequences();
+
   const uint32_t now = millis();
   if (captureMode == CAPTURE_MODE_EVENT) {
     advanceToFreshFolderIfNeeded("USB pause ended / block restart");
     eventBlockStartedMs = now;
     eventPhotosThisBlock = 0;
     nextEventPhotoDueMs = now + EVENT_PHOTO_INTERVAL_MS;
-    Serial.println("USB host disconnected: EVENT capture resumes in 750 ms; 2-minute block restarted");
+    Serial.println("USB host disconnected/ejected: SD remounted; EVENT resumes in 750 ms");
   } else {
     nextMotionCheckDueMs = now + MOTION_CHECK_INTERVAL_MS;
-    Serial.println("USB host disconnected: MONITORING resumes; next 5-frame check in 10 seconds");
+    Serial.println("USB host disconnected/ejected: SD remounted; MONITORING resumes in 10 seconds");
   }
   batteryEnterIdlePower();
 }
@@ -1954,7 +2064,8 @@ void loop() {
 
   // USB-C mass storage has priority over BLE. A request that arrives during a
   // comparison burst or SD photo write is handled after that operation returns.
-  if (usbHostConnected) {
+  if (usbHostConnected && !usbEjectRequested) {
+    bleStartRequested = false;
     if (bleModeActive) stopBluetoothBrowser();
     enterUsbMassStorageMode();
     if (!batteryActivePower) batteryEnterActivePower();
