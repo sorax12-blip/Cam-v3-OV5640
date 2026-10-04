@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - esp32-cam-hd-s26-fix
+      - ov3660-writable-msc
     paths:
       - 'firmware/full-exfat/**'
       - '.github/workflows/build-full-exfat.yml'
@@ -64,7 +65,9 @@ jobs:
           USB mass storage:
             Use the board connector labeled USB-OTG.
             Direct USB-C male to USB-C male is supported.
-            MSC is READ-ONLY in this full build.
+            MSC is WRITABLE in this build.
+            USB gets exclusive SD ownership while MSC is active.
+            ESP32 FatFs is unmounted before host access and remounted/rescanned after disconnect/eject.
 
           SD:
             FAT32/exFAT capable
